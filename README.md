@@ -14,6 +14,7 @@ NPA (Node Proxy Agent) 是一款专为局域网多机联调与 AI 自动化排�
 - SSH 页面只保留交互式终端，默认选择本地节点并在本地 shell 中执行命令；
 - 节点、隧道、设置、审计和加密凭据保存在内部 bbolt 状态库，不维护用户配置文件；
 - MCP 使用官方 Go SDK，默认只注册 `nodes.list`；SSH、File、Tunnel Capability 默认关闭并可在设置页即时开关；
+- MCP File Capability 继续提供 SFTP 工具：`file.list`、`file.read`、`file.write`、`file.remove`；大文件仍通过受控 Web 下载接口处理；
 - SSH 使用 `x/crypto/ssh`，SFTP 使用 `pkg/sftp`，支持 TOFU Host Key 指纹、密钥/口令/Agent 认证和连接复用；
 - 隧道复用 SSH `direct-tcpip`/`forwarded-tcpip`，带 KeepAlive、状态持久化和自动恢复；
 - Web Proxy 通过 `/proxy/{tunnel-id}/` 走受控反向代理，默认拒绝公网目标；

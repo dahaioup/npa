@@ -52,6 +52,13 @@ func TestCapabilityToolsRefresh(t *testing.T) {
 	if names := list(); !names["ssh.exec"] {
 		t.Fatalf("SSH tool was not registered after enabling capability: %#v", names)
 	}
+	if err := app.SaveSettings(map[string]string{"mcp_file": "true"}); err != nil {
+		t.Fatal(err)
+	}
+	manager.Refresh()
+	if names := list(); !names["file.list"] || !names["file.read"] || !names["file.write"] || !names["file.remove"] {
+		t.Fatalf("SFTP tools were not registered after enabling File capability: %#v", names)
+	}
 	if err := app.SaveSettings(map[string]string{"mcp_ssh": "false"}); err != nil {
 		t.Fatal(err)
 	}
