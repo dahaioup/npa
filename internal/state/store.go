@@ -121,6 +121,8 @@ func defaults() map[string]string {
 		"mcp_ssh":              "false",
 		"mcp_file":             "false",
 		"mcp_tunnel":           "false",
+		"mcp_screenshot":       "false",
+		"mcp_mouse":            "false",
 		"allow_public_targets": "false",
 		"log_level":            "info",
 		"audit_retention_days": "30",

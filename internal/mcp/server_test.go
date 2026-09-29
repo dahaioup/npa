@@ -59,6 +59,13 @@ func TestCapabilityToolsRefresh(t *testing.T) {
 	if names := list(); !names["file.list"] || !names["file.read"] || !names["file.write"] || !names["file.remove"] {
 		t.Fatalf("SFTP tools were not registered after enabling File capability: %#v", names)
 	}
+	if err := app.SaveSettings(map[string]string{"mcp_screenshot": "true", "mcp_mouse": "true"}); err != nil {
+		t.Fatal(err)
+	}
+	manager.Refresh()
+	if names := list(); !names["desktop.screens"] || !names["desktop.screenshot"] || !names["desktop.mouse_move"] || !names["desktop.mouse_click"] || !names["desktop.mouse_scroll"] {
+		t.Fatalf("desktop tools were not registered after enabling capabilities: %#v", names)
+	}
 	if err := app.SaveSettings(map[string]string{"mcp_ssh": "false"}); err != nil {
 		t.Fatal(err)
 	}

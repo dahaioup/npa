@@ -8,6 +8,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/npa/npa/internal/desktop"
 	"github.com/npa/npa/internal/model"
 	"github.com/npa/npa/internal/policy"
 	"github.com/npa/npa/internal/service"
@@ -39,6 +40,7 @@ func (m *Manager) Refresh() {
 		"nodes.list", "ssh.exec", "ssh.session_info",
 		"file.list", "file.read", "file.write", "file.remove",
 		"tunnel.list", "tunnel.open", "tunnel.close", "service.open_web",
+		"desktop.screens", "desktop.screenshot", "desktop.mouse_move", "desktop.mouse_click", "desktop.mouse_scroll",
 	)
 	mcpCtx := func(ctx context.Context) context.Context { return policy.WithSource(ctx, policy.SourceMCP) }
 	mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "nodes.list", Description: "List managed nodes"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
@@ -159,6 +161,58 @@ func (m *Manager) Refresh() {
 			return nil, map[string]any{"path": path, "url": "http://127.0.0.1:56700" + path}, nil
 		})
 	}
+	if capabilities["screenshot"] {
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "desktop.screens", Description: "List local screens and display geometry"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+			screens, err := m.service.Screens(mcpCtx(ctx))
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]any{"screens": screens}, nil
+		})
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "desktop.screenshot", Description: "Capture a PNG screenshot through the desktop provider"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			ScreenID string `json:"screen_id,omitempty" jsonschema:"screen ID; empty means primary screen"`
+		}) (*mcpsdk.CallToolResult, any, error) {
+			result, err := m.service.Screenshot(mcpCtx(ctx), desktop.CaptureRequest{ScreenID: input.ScreenID})
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, result, nil
+		})
+	}
+	if capabilities["mouse"] {
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "desktop.mouse_move", Description: "Move the local mouse cursor"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			X        int  `json:"x" jsonschema:"absolute X coordinate"`
+			Y        int  `json:"y" jsonschema:"absolute Y coordinate"`
+			Relative bool `json:"relative,omitempty" jsonschema:"move relative to current position"`
+		}) (*mcpsdk.CallToolResult, any, error) {
+			if err := m.service.MoveMouse(mcpCtx(ctx), desktop.MoveRequest{X: input.X, Y: input.Y, Relative: input.Relative}); err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]bool{"moved": true}, nil
+		})
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "desktop.mouse_click", Description: "Click a local mouse button"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			Button string `json:"button" jsonschema:"left, right or middle"`
+			Action string `json:"action,omitempty" jsonschema:"click, down or up"`
+		}) (*mcpsdk.CallToolResult, any, error) {
+			action := input.Action
+			if action == "" {
+				action = "click"
+			}
+			if err := m.service.MouseButton(mcpCtx(ctx), desktop.ButtonRequest{Button: input.Button, Action: action}); err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]bool{"clicked": true}, nil
+		})
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "desktop.mouse_scroll", Description: "Scroll the local mouse wheel"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			DeltaX int `json:"delta_x,omitempty" jsonschema:"horizontal scroll delta"`
+			DeltaY int `json:"delta_y" jsonschema:"vertical scroll delta"`
+		}) (*mcpsdk.CallToolResult, any, error) {
+			if err := m.service.Scroll(mcpCtx(ctx), desktop.ScrollRequest{DeltaX: input.DeltaX, DeltaY: input.DeltaY}); err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]bool{"scrolled": true}, nil
+		})
+	}
 }
 
 func (m *Manager) Handler() http.Handler {
@@ -170,11 +224,13 @@ func (m *Manager) Handler() http.Handler {
 func (m *Manager) Status() map[string]any {
 	settings := m.service.Settings()
 	return map[string]any{
-		"enabled":  settings["mcp_enabled"] == "true",
-		"ssh":      settings["mcp_ssh"] == "true",
-		"file":     settings["mcp_file"] == "true",
-		"tunnel":   settings["mcp_tunnel"] == "true",
-		"endpoint": "http://127.0.0.1:56701/mcp",
+		"enabled":    settings["mcp_enabled"] == "true",
+		"ssh":        settings["mcp_ssh"] == "true",
+		"file":       settings["mcp_file"] == "true",
+		"tunnel":     settings["mcp_tunnel"] == "true",
+		"screenshot": settings["mcp_screenshot"] == "true",
+		"mouse":      settings["mcp_mouse"] == "true",
+		"endpoint":   "http://127.0.0.1:56701/mcp",
 	}
 }
 

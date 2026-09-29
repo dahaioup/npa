@@ -22,6 +22,21 @@ NPA (Node Proxy Agent) 是一款专为局域网多机联调与 AI 自动化排�
 
 文件浏览 API 和 SFTP 适配器仍保留在服务层，当前 Web 导航暂不展示独立“文件”页面。
 
+## Phase 2 — Desktop + Plugin Runtime
+
+当前已加入二期基础能力：
+
+- 独立 Desktop Plugin 进程，使用 JSON-RPC 2.0 + `Content-Length` framing + stdio；
+- Plugin Manager 支持初始化、健康检查、调用、超时、崩溃隔离和优雅关闭；
+- 插件缺失或不可用时自动回退到嵌入式系统命令脚本；
+- `desktop.screens`、`desktop.screenshot` MCP 工具；
+- `desktop.mouse_move`、`desktop.mouse_click`、`desktop.mouse_scroll` MCP 工具；
+- Screenshot 与 Mouse 为独立 Capability，默认关闭，并统一经过审计；
+- 截图资源由 Core 分配和清理，不把大图直接塞入 MCP JSON；
+- Core 继续保持 `CGO_ENABLED=0`，平台能力通过插件或脚本回退隔离。
+
+macOS 截图需要系统“屏幕录制”权限；未授权时工具会返回明确错误，不会导致 Core 崩溃。
+
 ## 构建与运行
 
 ```bash

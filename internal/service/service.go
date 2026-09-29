@@ -6,21 +6,24 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/npa/npa/internal/audit"
+	"github.com/npa/npa/internal/desktop"
 	apperrors "github.com/npa/npa/internal/errors"
 	"github.com/npa/npa/internal/file"
 	"github.com/npa/npa/internal/model"
+	"github.com/npa/npa/internal/plugin"
 	"github.com/npa/npa/internal/policy"
 	sshx "github.com/npa/npa/internal/ssh"
 	"github.com/npa/npa/internal/state"
 	"github.com/npa/npa/internal/tunnel"
 )
 
-const Version = "0.1.0-phase1"
+const Version = "0.2.0-phase2"
 
 type Service struct {
 	Store             *state.Store
@@ -28,6 +31,9 @@ type Service struct {
 	Files             *file.Service
 	Tunnels           *tunnel.Manager
 	Audit             *audit.Logger
+	Desktop           *desktop.Router
+	Plugin            *plugin.Manager
+	resourceDir       string
 	started           time.Time
 	mu                sync.RWMutex
 	limiter           map[string]*rateWindow
@@ -43,10 +49,13 @@ func New(store *state.Store) *Service {
 	sshManager := sshx.NewManager(store)
 	fileService := file.NewService(sshManager)
 	tunnelManager := tunnel.NewManager(store, sshManager)
+	resourceDir, _ := os.MkdirTemp("", "npa-resources-*")
 	app := &Service{
 		Store: store, SSH: sshManager, Files: fileService, Tunnels: tunnelManager,
-		Audit: audit.New(store), started: time.Now(), limiter: map[string]*rateWindow{},
+		Audit: audit.New(store), started: time.Now(), limiter: map[string]*rateWindow{}, resourceDir: resourceDir,
 	}
+	app.Plugin = plugin.NewManager(filepath.Join("plugins", "desktop"))
+	app.Desktop = desktop.NewRouterWithRoot(app.Plugin, resourceDir)
 	tunnelManager.TargetValidator = app.validateTarget
 	return app
 }
@@ -54,6 +63,12 @@ func New(store *state.Store) *Service {
 func (s *Service) Close() {
 	s.Tunnels.Close()
 	_ = s.SSH.CloseAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = s.Plugin.Close(ctx)
+	cancel()
+	if s.resourceDir != "" {
+		_ = os.RemoveAll(s.resourceDir)
+	}
 	_ = s.Store.Close()
 }
 
@@ -61,7 +76,8 @@ func (s *Service) MCPCapabilities() map[string]bool {
 	settings, _ := s.Store.Settings()
 	return map[string]bool{
 		"ssh": parseBool(settings["mcp_ssh"]), "file": parseBool(settings["mcp_file"]),
-		"tunnel": parseBool(settings["mcp_tunnel"]),
+		"tunnel": parseBool(settings["mcp_tunnel"]), "screenshot": parseBool(settings["mcp_screenshot"]),
+		"mouse": parseBool(settings["mcp_mouse"]),
 	}
 }
 
@@ -217,6 +233,56 @@ func (s *Service) OpenShell(ctx context.Context, nodeID string, cols, rows int) 
 	shell, err := s.SSH.OpenShell(ctx, nodeID, cols, rows)
 	s.Audit.Record(ctx, "ssh.shell", nodeID, policy.CapSSH, "", time.Now(), err)
 	return shell, err
+}
+
+func (s *Service) Screens(ctx context.Context) ([]desktop.Screen, error) {
+	if err := s.Authorize(ctx, "desktop.screens", policy.CapScreenshot); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	screens, err := s.Desktop.Screens(ctx)
+	s.Audit.Record(ctx, "desktop.screens", "", policy.CapScreenshot, "", started, err)
+	return screens, err
+}
+
+func (s *Service) Screenshot(ctx context.Context, request desktop.CaptureRequest) (desktop.CaptureResult, error) {
+	if err := s.Authorize(ctx, "desktop.screenshot", policy.CapScreenshot); err != nil {
+		return desktop.CaptureResult{}, err
+	}
+	started := time.Now()
+	result, err := s.Desktop.Screenshot(ctx, request)
+	s.Audit.Record(ctx, "desktop.screenshot", "", policy.CapScreenshot, audit.SafeParameters(map[string]string{"screen": request.ScreenID}), started, err)
+	return result, err
+}
+
+func (s *Service) MoveMouse(ctx context.Context, request desktop.MoveRequest) error {
+	if err := s.Authorize(ctx, "desktop.mouse_move", policy.CapMouse); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := s.Desktop.MoveMouse(ctx, request)
+	s.Audit.Record(ctx, "desktop.mouse_move", "", policy.CapMouse, audit.SafeParameters(map[string]string{"x": fmt.Sprintf("%d", request.X), "y": fmt.Sprintf("%d", request.Y)}), started, err)
+	return err
+}
+
+func (s *Service) MouseButton(ctx context.Context, request desktop.ButtonRequest) error {
+	if err := s.Authorize(ctx, "desktop.mouse_click", policy.CapMouse); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := s.Desktop.MouseButton(ctx, request)
+	s.Audit.Record(ctx, "desktop.mouse_click", "", policy.CapMouse, audit.SafeParameters(map[string]string{"button": request.Button, "action": request.Action}), started, err)
+	return err
+}
+
+func (s *Service) Scroll(ctx context.Context, request desktop.ScrollRequest) error {
+	if err := s.Authorize(ctx, "desktop.mouse_scroll", policy.CapMouse); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := s.Desktop.Scroll(ctx, request)
+	s.Audit.Record(ctx, "desktop.mouse_scroll", "", policy.CapMouse, audit.SafeParameters(map[string]string{"dx": fmt.Sprintf("%d", request.DeltaX), "dy": fmt.Sprintf("%d", request.DeltaY)}), started, err)
+	return err
 }
 
 func (s *Service) FileList(ctx context.Context, nodeID, path string) ([]model.FileEntry, error) {
