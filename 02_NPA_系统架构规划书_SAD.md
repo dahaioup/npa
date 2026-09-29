@@ -71,7 +71,7 @@
                           SSH / SFTP / TCP
 ```
 
-Phase 1 不包含自动发现。节点由用户通过 Web 添加。
+Phase 1 不包含自动发现。节点页默认展示本地节点；已管理节点由内部状态库承载，三期 Discovery 接入后再展示自动发现拓扑。
 
 ### 2.2 Phase 2 — Plugin Runtime + Desktop
 
@@ -505,25 +505,18 @@ type Store interface {
 ```text
 Overview
 Nodes
-  └─ Node Detail
-       ├─ SSH
-       ├─ Files
-       ├─ Services
-       └─ Tunnels
+  └─ Topology placeholder
+       └─ Node Detail (click to inspect)
 SSH
-Files
 Tunnels
-MCP
-  ├─ Service ON/OFF
-  ├─ SSH Permission
-  ├─ File Permission
-  ├─ Tunnel Permission
-  ├─ Screenshot Permission   # Phase 2
-  └─ Mouse Permission        # Phase 2
 Discovery                    # Phase 3
 Network / Relay              # Phase 3
 Audit
 Settings
+  ├─ MCP Service ON/OFF
+  ├─ SSH Permission
+  ├─ File Permission
+  └─ Tunnel Permission
 About
 ```
 
