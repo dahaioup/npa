@@ -4,6 +4,7 @@ import "time"
 
 type Node struct {
 	ID                 string    `json:"id"`
+	DisplayID          string    `json:"display_id,omitempty"`
 	Name               string    `json:"name"`
 	Address            string    `json:"address"`
 	Port               int       `json:"port"`
@@ -14,6 +15,12 @@ type Node struct {
 	Status             string    `json:"status"`
 	LastError          string    `json:"last_error,omitempty"`
 	HostKeyFingerprint string    `json:"host_key_fingerprint,omitempty"`
+	ReachableSubnets   []string  `json:"reachable_subnets,omitempty"`
+	Capabilities       []string  `json:"capabilities,omitempty"`
+	RelayEnabled       bool      `json:"relay_enabled"`
+	Trusted            bool      `json:"trusted"`
+	Discovered         bool      `json:"discovered"`
+	LastSeen           time.Time `json:"last_seen,omitempty"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
@@ -77,4 +84,19 @@ type Overview struct {
 	Tunnels       int    `json:"tunnels"`
 	Running       int    `json:"running"`
 	MCPEnabled    bool   `json:"mcp_enabled"`
+}
+
+type SubnetInfo struct {
+	Source string `json:"source"`
+	NodeID string `json:"node_id,omitempty"`
+	Prefix string `json:"prefix"`
+}
+
+type RelayRoute struct {
+	TargetSubnet string    `json:"target_subnet"`
+	ViaNodeID    string    `json:"via_node_id"`
+	Hops         []string  `json:"hops"`
+	RTTMS        int64     `json:"rtt_ms"`
+	Healthy      bool      `json:"healthy"`
+	LastChecked  time.Time `json:"last_checked"`
 }

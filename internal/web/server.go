@@ -113,6 +113,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
 	mux.HandleFunc("PUT /api/settings", s.handleSettingsSave)
 	mux.HandleFunc("GET /api/mcp", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.mcp.Status()) })
+	mux.HandleFunc("GET /api/discovery", s.handleDiscoveryNodes)
+	mux.HandleFunc("POST /api/discovery/refresh", s.handleDiscoveryRefresh)
+	mux.HandleFunc("GET /api/network/subnets", s.handleNetworkSubnets)
+	mux.HandleFunc("GET /api/relay/routes", s.handleRelayRoutes)
+	mux.HandleFunc("POST /api/relay/open", s.handleRelayOpen)
 	mux.HandleFunc("GET /api/audit", s.handleAudit)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /proxy/{id}/", s.handleProxy)
@@ -435,6 +440,70 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.app.Settings())
+}
+
+func (s *Server) handleDiscoveryNodes(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.app.DiscoveryNodes(policy.WithSource(r.Context(), policy.SourceWeb))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, nodes)
+}
+
+func (s *Server) handleDiscoveryRefresh(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DiscoveryRefresh(policy.WithSource(r.Context(), policy.SourceWeb)); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"refreshed": true})
+}
+
+func (s *Server) handleNetworkSubnets(w http.ResponseWriter, r *http.Request) {
+	subnets, err := s.app.NetworkSubnets(policy.WithSource(r.Context(), policy.SourceWeb))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, subnets)
+}
+
+func (s *Server) handleRelayRoutes(w http.ResponseWriter, r *http.Request) {
+	routes, err := s.app.RelayRoutes(policy.WithSource(r.Context(), policy.SourceWeb))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, routes)
+}
+
+func (s *Server) handleRelayOpen(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Target           string `json:"target"`
+		TargetCapability string `json:"target_capability"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	capability := policy.CapTunnel
+	switch strings.ToLower(request.TargetCapability) {
+	case "", "tunnel":
+		capability = policy.CapTunnel
+	case "ssh":
+		capability = policy.CapSSH
+	case "file":
+		capability = policy.CapFile
+	default:
+		writeError(w, apperrors.New(apperrors.InvalidArgument, "unsupported target capability"))
+		return
+	}
+	route, err := s.app.RelayOpen(policy.WithSource(r.Context(), policy.SourceWeb), request.Target, capability)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, route)
 }
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {

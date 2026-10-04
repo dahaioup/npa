@@ -237,6 +237,10 @@ type ExecRequest struct {
 	Timeout time.Duration
 }
 
+func isLocalNodeID(nodeID string) bool {
+	return nodeID == "local" || nodeID == model.NodeIDFromMAC()
+}
+
 func localShellCommand() (string, []string) {
 	if runtime.GOOS == "windows" {
 		return "cmd.exe", []string{"/Q"}
@@ -285,7 +289,7 @@ func (m *Manager) localExec(ctx context.Context, request ExecRequest) (model.Exe
 }
 
 func (m *Manager) Exec(ctx context.Context, nodeID string, request ExecRequest) (model.ExecResult, error) {
-	if nodeID == "local" {
+	if isLocalNodeID(nodeID) {
 		return m.localExec(ctx, request)
 	}
 	client, err := m.Client(ctx, nodeID)
@@ -391,7 +395,7 @@ func (m *Manager) openLocalShell() (*Shell, error) {
 }
 
 func (m *Manager) OpenShell(ctx context.Context, nodeID string, cols, rows int) (*Shell, error) {
-	if nodeID == "local" {
+	if isLocalNodeID(nodeID) {
 		return m.openLocalShell()
 	}
 	client, err := m.Client(ctx, nodeID)

@@ -13,17 +13,19 @@ import (
 
 	"github.com/npa/npa/internal/audit"
 	"github.com/npa/npa/internal/desktop"
+	"github.com/npa/npa/internal/discovery"
 	apperrors "github.com/npa/npa/internal/errors"
 	"github.com/npa/npa/internal/file"
 	"github.com/npa/npa/internal/model"
 	"github.com/npa/npa/internal/plugin"
 	"github.com/npa/npa/internal/policy"
+	"github.com/npa/npa/internal/relay"
 	sshx "github.com/npa/npa/internal/ssh"
 	"github.com/npa/npa/internal/state"
 	"github.com/npa/npa/internal/tunnel"
 )
 
-const Version = "0.2.0-phase2"
+const Version = "0.3.0-phase3"
 
 type Service struct {
 	Store             *state.Store
@@ -33,6 +35,8 @@ type Service struct {
 	Audit             *audit.Logger
 	Desktop           *desktop.Router
 	Plugin            *plugin.Manager
+	Discovery         *discovery.Manager
+	Relay             *relay.Manager
 	resourceDir       string
 	started           time.Time
 	mu                sync.RWMutex
@@ -56,6 +60,8 @@ func New(store *state.Store) *Service {
 	}
 	app.Plugin = plugin.NewManager(filepath.Join("plugins", "desktop"))
 	app.Desktop = desktop.NewRouterWithRoot(app.Plugin, resourceDir)
+	app.Discovery = discovery.NewManager(store, Version)
+	app.Relay = relay.NewManager(store, sshManager)
 	tunnelManager.TargetValidator = app.validateTarget
 	return app
 }
@@ -69,15 +75,21 @@ func (s *Service) Close() {
 	if s.resourceDir != "" {
 		_ = os.RemoveAll(s.resourceDir)
 	}
+	if s.Discovery != nil {
+		s.Discovery.Close()
+	}
 	_ = s.Store.Close()
 }
 
 func (s *Service) MCPCapabilities() map[string]bool {
 	settings, _ := s.Store.Settings()
+	loopback := settings["mcp_bind_scope"] != "lan"
 	return map[string]bool{
 		"ssh": parseBool(settings["mcp_ssh"]), "file": parseBool(settings["mcp_file"]),
 		"tunnel": parseBool(settings["mcp_tunnel"]), "screenshot": parseBool(settings["mcp_screenshot"]),
-		"mouse": parseBool(settings["mcp_mouse"]),
+		"mouse":     parseBool(settings["mcp_mouse"]),
+		"discovery": !loopback && parseBool(settings["mcp_discovery"]),
+		"relay":     !loopback && parseBool(settings["mcp_relay"]),
 	}
 }
 
@@ -89,13 +101,36 @@ func (s *Service) Settings() map[string]string {
 }
 
 func (s *Service) SaveSettings(values map[string]string) error {
+	current := s.Settings()
+	scope := values["mcp_bind_scope"]
+	if scope == "" {
+		scope = current["mcp_bind_scope"]
+	}
+	if scope != "lan" {
+		explicitDiscovery := values["mcp_discovery"] == "true"
+		explicitRelay := values["mcp_relay"] == "true"
+		if explicitDiscovery || explicitRelay {
+			return apperrors.New(apperrors.InvalidArgument, "仅本机 MCP 范围不允许开启节点发现或中继权限")
+		}
+		if _, changingScope := values["mcp_bind_scope"]; changingScope || current["mcp_discovery"] == "true" || current["mcp_relay"] == "true" {
+			values["mcp_discovery"] = "false"
+			values["mcp_relay"] = "false"
+		}
+	}
 	if err := s.Store.SaveSettings(values); err != nil {
 		return err
+	}
+	s.ApplyRuntimeSettings(context.Background())
+	return nil
+}
+
+func (s *Service) ApplyRuntimeSettings(ctx context.Context) {
+	if s.Discovery != nil {
+		_ = s.Discovery.SetEnabled(ctx, parseBool(s.Settings()["discovery_enabled"]))
 	}
 	if s.OnSettingsChanged != nil {
 		s.OnSettingsChanged()
 	}
-	return nil
 }
 
 func (s *Service) Authorize(ctx context.Context, operation string, capability policy.Capability) error {
@@ -137,10 +172,30 @@ func localNode() model.Node {
 		userName = "local"
 	}
 	return model.Node{
-		ID: "local", Name: "本地节点", Address: host, Port: 0, Username: userName,
+		ID: model.NodeIDFromMAC(), DisplayID: model.NodeIDFromMAC(), Name: "本地节点", Address: host, Port: 0, Username: userName,
 		AuthMethod: "local", Protocol: "local", Tags: []string{"local"},
 		Status: "connected", CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Now().UTC(),
 	}
+}
+
+func isLocalNodeID(id string) bool {
+	return id == "local" || id == model.NodeIDFromMAC()
+}
+
+func discoveredFallbackID(node model.Node) string {
+	var builder strings.Builder
+	for _, char := range strings.ToLower(node.Name + "-" + node.Address) {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			builder.WriteRune(char)
+		} else {
+			builder.WriteByte('-')
+		}
+	}
+	id := strings.Trim(builder.String(), "-")
+	if id == "" {
+		id = "node"
+	}
+	return "discovered-" + id
 }
 
 func (s *Service) ListNodes() ([]model.Node, error) {
@@ -148,11 +203,31 @@ func (s *Service) ListNodes() ([]model.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append([]model.Node{localNode()}, nodes...), nil
+	result := append([]model.Node{localNode()}, nodes...)
+	known := map[string]struct{}{}
+	for _, node := range result {
+		known[node.ID] = struct{}{}
+	}
+	discovered, err := s.Store.ListDiscoveredNodes()
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range discovered {
+		candidate := node
+		if _, exists := known[candidate.ID]; exists {
+			candidate.ID = discoveredFallbackID(candidate)
+			if _, exists := known[candidate.ID]; exists {
+				candidate.ID += "-" + fmt.Sprintf("%x", time.Now().UnixNano())
+			}
+		}
+		result = append(result, candidate)
+		known[candidate.ID] = struct{}{}
+	}
+	return result, nil
 }
 
 func (s *Service) GetNode(id string) (model.Node, error) {
-	if id == "local" {
+	if isLocalNodeID(id) {
 		return localNode(), nil
 	}
 	return s.Store.GetNode(id)
@@ -185,7 +260,7 @@ func (s *Service) DeleteNode(ctx context.Context, id string) error {
 }
 
 func (s *Service) ConnectNode(ctx context.Context, id string) error {
-	if id == "local" {
+	if isLocalNodeID(id) {
 		return nil
 	}
 	if err := s.Authorize(ctx, "ssh.connect", policy.CapSSH); err != nil {
@@ -202,7 +277,7 @@ func (s *Service) ConnectNode(ctx context.Context, id string) error {
 }
 
 func (s *Service) DisconnectNode(ctx context.Context, id string) error {
-	if id == "local" {
+	if isLocalNodeID(id) {
 		return nil
 	}
 	if err := s.Authorize(ctx, "ssh.disconnect", policy.CapSSH); err != nil {
@@ -285,7 +360,82 @@ func (s *Service) Scroll(ctx context.Context, request desktop.ScrollRequest) err
 	return err
 }
 
+func (s *Service) DiscoveryNodes(ctx context.Context) ([]model.Node, error) {
+	if err := s.Authorize(ctx, "discovery.nodes", policy.CapDiscovery); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	nodes, err := s.Discovery.Nodes()
+	s.Audit.Record(ctx, "discovery.nodes", "", policy.CapDiscovery, "", started, err)
+	return nodes, err
+}
+
+func (s *Service) DiscoveryRefresh(ctx context.Context) error {
+	if err := s.Authorize(ctx, "discovery.refresh", policy.CapDiscovery); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := s.Discovery.Refresh(ctx)
+	s.Audit.Record(ctx, "discovery.refresh", "", policy.CapDiscovery, "", started, err)
+	return err
+}
+
+func (s *Service) NetworkSubnets(ctx context.Context) ([]model.SubnetInfo, error) {
+	if err := s.Authorize(ctx, "network.subnets", policy.CapDiscovery); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	subnets, err := s.Relay.Subnets(ctx)
+	s.Audit.Record(ctx, "network.subnets", "", policy.CapDiscovery, "", started, err)
+	return subnets, err
+}
+
+func (s *Service) RelayRoutes(ctx context.Context) ([]model.RelayRoute, error) {
+	if err := s.Authorize(ctx, "relay.routes", policy.CapRelay); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	routes, err := s.Relay.Routes()
+	s.Audit.Record(ctx, "relay.routes", "", policy.CapRelay, "", started, err)
+	return routes, err
+}
+
+func (s *Service) RelayOpen(ctx context.Context, target string, targetCapability policy.Capability) (model.RelayRoute, error) {
+	if err := s.Authorize(ctx, "relay.open", policy.CapRelay); err != nil {
+		return model.RelayRoute{}, err
+	}
+	if targetCapability != policy.CapBase {
+		if err := s.Authorize(ctx, "relay.open", targetCapability); err != nil {
+			return model.RelayRoute{}, err
+		}
+	}
+	started := time.Now()
+	route, err := s.Relay.Select(ctx, target)
+	s.Audit.Record(ctx, "relay.open", route.ViaNodeID, policy.CapRelay, audit.SafeParameters(map[string]string{"target": target}), started, err)
+	return route, err
+}
+
+func (s *Service) RelayDial(ctx context.Context, target string) (net.Conn, error) {
+	if err := s.Authorize(ctx, "relay.dial", policy.CapRelay); err != nil {
+		return nil, err
+	}
+	if err := s.Authorize(ctx, "relay.dial", policy.CapTunnel); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	conn, err := s.Relay.Dial(ctx, target)
+	if err == nil {
+		s.Audit.Record(ctx, "relay.dial", "", policy.CapRelay, audit.SafeParameters(map[string]string{"target": target}), started, nil)
+	} else {
+		s.Audit.Record(ctx, "relay.dial", "", policy.CapRelay, audit.SafeParameters(map[string]string{"target": target}), started, err)
+	}
+	return conn, err
+}
+
 func (s *Service) FileList(ctx context.Context, nodeID, path string) ([]model.FileEntry, error) {
+	if isLocalNodeID(nodeID) {
+		return nil, apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.list", policy.CapFile); err != nil {
 		return nil, err
 	}
@@ -296,6 +446,9 @@ func (s *Service) FileList(ctx context.Context, nodeID, path string) ([]model.Fi
 }
 
 func (s *Service) FileRead(ctx context.Context, nodeID, path string) ([]byte, error) {
+	if isLocalNodeID(nodeID) {
+		return nil, apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.read", policy.CapFile); err != nil {
 		return nil, err
 	}
@@ -306,6 +459,9 @@ func (s *Service) FileRead(ctx context.Context, nodeID, path string) ([]byte, er
 }
 
 func (s *Service) FileWrite(ctx context.Context, nodeID, path string, data []byte) error {
+	if isLocalNodeID(nodeID) {
+		return apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.write", policy.CapFile); err != nil {
 		return err
 	}
@@ -316,6 +472,9 @@ func (s *Service) FileWrite(ctx context.Context, nodeID, path string, data []byt
 }
 
 func (s *Service) FileRemove(ctx context.Context, nodeID, path string) error {
+	if isLocalNodeID(nodeID) {
+		return apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.remove", policy.CapFile); err != nil {
 		return err
 	}
@@ -326,6 +485,9 @@ func (s *Service) FileRemove(ctx context.Context, nodeID, path string) error {
 }
 
 func (s *Service) FileMkdir(ctx context.Context, nodeID, path string) error {
+	if isLocalNodeID(nodeID) {
+		return apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.mkdir", policy.CapFile); err != nil {
 		return err
 	}
@@ -336,6 +498,9 @@ func (s *Service) FileMkdir(ctx context.Context, nodeID, path string) error {
 }
 
 func (s *Service) FileRename(ctx context.Context, nodeID, oldPath, newPath string) error {
+	if isLocalNodeID(nodeID) {
+		return apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.rename", policy.CapFile); err != nil {
 		return err
 	}
@@ -346,6 +511,9 @@ func (s *Service) FileRename(ctx context.Context, nodeID, oldPath, newPath strin
 }
 
 func (s *Service) FileUpload(ctx context.Context, nodeID, path string, reader interface{ Read([]byte) (int, error) }) (int64, error) {
+	if isLocalNodeID(nodeID) {
+		return 0, apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.write", policy.CapFile); err != nil {
 		return 0, err
 	}
@@ -359,6 +527,9 @@ func (s *Service) FileDownload(ctx context.Context, nodeID, path string) (interf
 	Read([]byte) (int, error)
 	Close() error
 }, error) {
+	if isLocalNodeID(nodeID) {
+		return nil, apperrors.New(apperrors.NotSupported, "local file browsing is not enabled")
+	}
 	if err := s.Authorize(ctx, "file.read", policy.CapFile); err != nil {
 		return nil, err
 	}
@@ -375,6 +546,9 @@ func (s *Service) FileDownload(ctx context.Context, nodeID, path string) (interf
 func (s *Service) ListTunnels() ([]model.Tunnel, error) { return s.Tunnels.List() }
 
 func (s *Service) SaveTunnel(ctx context.Context, definition model.Tunnel) error {
+	if isLocalNodeID(definition.NodeID) {
+		return apperrors.New(apperrors.NotSupported, "local node cannot create SSH tunnels")
+	}
 	if err := s.Authorize(ctx, "tunnel.write", policy.CapTunnel); err != nil {
 		return err
 	}
@@ -392,6 +566,9 @@ func (s *Service) StartTunnel(ctx context.Context, id string) (model.Tunnel, err
 	definition, err := s.Store.GetTunnel(id)
 	if err != nil {
 		return definition, err
+	}
+	if isLocalNodeID(definition.NodeID) {
+		return definition, apperrors.New(apperrors.NotSupported, "local node cannot create SSH tunnels")
 	}
 	if definition.Type != "socks" {
 		if err := s.validateTarget(definition.TargetHost, definition.TargetPort); err != nil {
@@ -450,6 +627,9 @@ func (s *Service) validateTarget(host string, port int) error {
 }
 
 func (s *Service) OpenWeb(ctx context.Context, nodeID, targetHost string, targetPort int) (string, error) {
+	if isLocalNodeID(nodeID) {
+		return "", apperrors.New(apperrors.NotSupported, "local node cannot open SSH web proxy")
+	}
 	if err := s.Authorize(ctx, "service.open_web", policy.CapTunnel); err != nil {
 		return "", err
 	}
@@ -475,7 +655,7 @@ func (s *Service) OpenWeb(ctx context.Context, nodeID, targetHost string, target
 }
 
 func (s *Service) Overview() model.Overview {
-	nodes, _ := s.Store.ListNodes()
+	nodes, _ := s.ListNodes()
 	tunnels, _ := s.Tunnels.List()
 	connected := 0
 	for _, node := range nodes {

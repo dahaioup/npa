@@ -112,6 +112,7 @@ NPA 是面向开发、测试、运维和 AI Agent 的轻量级局域网节点访
 
 - FR-03.1 一期节点界面默认展示本地节点，不提供手工添加入口；已管理节点由内部状态库承载，三期 Discovery 接入后在节点拓扑中展示自动发现节点。
 - FR-03.2 节点至少记录：`node_id`、名称、地址、SSH 端口、用户名、认证方式、标签、最近连接状态。
+- FR-03.2.1 节点展示 ID 应从 MAC 地址稳定派生为 8 位大写字母与数字组合，并避免直接暴露完整 MAC 地址。
 - FR-03.3 SSH 默认端口为 22，但允许按节点修改。
 - FR-03.4 节点凭据不得明文展示或写入日志。
 - FR-03.5 应支持 SSH 私钥认证；可选支持口令认证。
@@ -161,7 +162,7 @@ NPA 是面向开发、测试、运维和 AI Agent 的轻量级局域网节点访
 ### FR-08 MCP Server
 
 - FR-08.1 MCP Server 应优先采用官方 `github.com/modelcontextprotocol/go-sdk`。
-- FR-08.2 MCP Streamable HTTP 固定监听 `127.0.0.1:56701`。
+- FR-08.2 MCP Streamable HTTP 默认固定监听 `127.0.0.1:56701`；用户可在设置中切换为局域网监听范围，切换后即时重建监听。
 - FR-08.3 可保留 stdio MCP 作为本地进程集成方式。
 - FR-08.4 MCP HTTP 服务可在 Web 设置中启用/关闭。
 - FR-08.5 MCP Server 必须准确声明当前可用 Tools 和 Capabilities。
@@ -203,6 +204,7 @@ MCP 权限不再使用笼统的 `read/write` 两档作为唯一模型，而采�
 - FR-09.3 `mouse` 属于高权限能力，开启时 Web 应醒目标识。
 - FR-09.4 Capability 修改应写入审计日志。
 - FR-09.5 Capability 检查必须位于所有 MCP 执行路径的统一入口。
+- FR-09.6 当 MCP 服务范围为仅本机时，`discovery` 与 `relay` Capability 必须不可开启且不注册对应工具。
 
 ### FR-10 审计与安全
 
@@ -271,23 +273,23 @@ not_supported
 
 ### FR-14 Discovery
 
-- FR-16.1 Discovery 可在 Web 中独立开启/关闭。
-- FR-16.2 Discovery 不占用 NPA 自定义发现端口。
-- FR-16.3 局域网发现优先使用标准 mDNS/DNS-SD `5353/UDP`。
-- FR-16.4 服务类型建议使用 `_npa._tcp.local.`。
-- FR-16.5 mDNS 广播仅携带发现所需的最小信息，不传输凭据。
-- FR-16.6 广播信息至少包含：节点 ID、名称、版本、NPA 服务端口/入口、Capabilities 摘要。
-- FR-16.7 详细节点信息应在发现后通过受认证的 NPA Node API 获取。
-- FR-16.8 一期手工节点管理必须继续可用；Discovery 只是增强能力，不能成为 SSH/SFTP/Tunnel 的强依赖。
-- FR-16.9 可保留受限主动探测作为可选补充，但不得默认进行大范围网段扫描。
+- FR-14.1 Discovery 可在 Web 中独立开启/关闭。
+- FR-14.2 Discovery 不占用 NPA 自定义发现端口。
+- FR-14.3 局域网发现优先使用标准 mDNS/DNS-SD `5353/UDP`。
+- FR-14.4 服务类型建议使用 `_npa._tcp.local.`。
+- FR-14.5 mDNS 广播仅携带发现所需的最小信息，不传输凭据。
+- FR-14.6 广播信息至少包含：节点 ID、名称、版本、NPA 服务端口/入口、Capabilities 摘要。
+- FR-14.7 详细节点信息应在发现后通过受认证的 NPA Node API 获取。
+- FR-14.8 一期手工节点管理必须继续可用；Discovery 只是增强能力，不能成为 SSH/SFTP/Tunnel 的强依赖。
+- FR-14.9 可保留受限主动探测作为可选补充，但不得默认进行大范围网段扫描。
 
 ### FR-15 子网能力上报
 
-- FR-16.1 NPA 节点应能读取本机接口和路由信息，形成 `reachable_subnets`。
-- FR-16.2 节点可向已认证的其他 NPA 节点上报自己可访问的私有子网。
-- FR-16.3 `reachable_subnets` 仅代表网络可达性声明，不代表目标设备已经授权。
-- FR-16.4 默认只允许 RFC1918、链路本地等私有范围作为自动 Relay 子网。
-- FR-16.5 Web 应展示“本节点可达子网”和“其他节点宣告的可达子网”。
+- FR-15.1 NPA 节点应能读取本机接口和路由信息，形成 `reachable_subnets`。
+- FR-15.2 节点可向已认证的其他 NPA 节点上报自己可访问的私有子网。
+- FR-15.3 `reachable_subnets` 仅代表网络可达性声明，不代表目标设备已经授权。
+- FR-15.4 默认只允许 RFC1918、链路本地等私有范围作为自动 Relay 子网。
+- FR-15.5 Web 应展示“本节点可达子网”和“其他节点宣告的可达子网”。
 
 ### FR-16 Relay / 子网代理
 

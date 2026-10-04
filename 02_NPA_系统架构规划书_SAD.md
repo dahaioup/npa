@@ -164,7 +164,7 @@ plugins/
 | 端口 | 地址 | 用途 |
 | --- | --- | --- |
 | `56700/tcp` | `127.0.0.1` | Web UI + REST API + Web Proxy |
-| `56701/tcp` | `127.0.0.1` | MCP Streamable HTTP |
+| `56701/tcp` | `127.0.0.1`（默认）或局域网范围 | MCP Streamable HTTP；范围由 Web 设置控制 |
 | `5353/udp` | mDNS 标准组播 | Phase 3 Discovery；非 NPA 私有端口 |
 
 NPA **不预留发现端口范围**。
@@ -505,15 +505,18 @@ type Store interface {
 ```text
 Overview
 Nodes
-  └─ Topology placeholder
-       └─ Node Detail (click to inspect)
+  ├─ mDNS Topology
+  ├─ Node Detail (click to inspect)
+  └─ Reachable Subnets / Relay Routes
 SSH
 Tunnels
-Discovery                    # Phase 3
-Network / Relay              # Phase 3
 Audit
 Settings
+  ├─ MCP Service Scope
   ├─ MCP Service ON/OFF
+  ├─ Discovery Service ON/OFF
+  ├─ Discovery Permission
+  ├─ Relay Permission
   ├─ SSH Permission
   ├─ File Permission
   └─ Tunnel Permission

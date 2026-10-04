@@ -3,12 +3,14 @@ package mcp
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/npa/npa/internal/desktop"
+	apperrors "github.com/npa/npa/internal/errors"
 	"github.com/npa/npa/internal/model"
 	"github.com/npa/npa/internal/policy"
 	"github.com/npa/npa/internal/service"
@@ -41,6 +43,7 @@ func (m *Manager) Refresh() {
 		"file.list", "file.read", "file.write", "file.remove",
 		"tunnel.list", "tunnel.open", "tunnel.close", "service.open_web",
 		"desktop.screens", "desktop.screenshot", "desktop.mouse_move", "desktop.mouse_click", "desktop.mouse_scroll",
+		"discovery.nodes", "discovery.refresh", "network.subnets", "relay.routes", "relay.open",
 	)
 	mcpCtx := func(ctx context.Context) context.Context { return policy.WithSource(ctx, policy.SourceMCP) }
 	mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "nodes.list", Description: "List managed nodes"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
@@ -213,6 +216,58 @@ func (m *Manager) Refresh() {
 			return nil, map[string]bool{"scrolled": true}, nil
 		})
 	}
+	if capabilities["discovery"] {
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "discovery.nodes", Description: "List nodes discovered through mDNS"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+			nodes, err := m.service.DiscoveryNodes(mcpCtx(ctx))
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]any{"nodes": nodes}, nil
+		})
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "discovery.refresh", Description: "Refresh the mDNS discovery browser"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+			if err := m.service.DiscoveryRefresh(mcpCtx(ctx)); err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]bool{"refreshed": true}, nil
+		})
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "network.subnets", Description: "List local and discovered reachable subnets"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+			subnets, err := m.service.NetworkSubnets(mcpCtx(ctx))
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]any{"subnets": subnets}, nil
+		})
+	}
+	if capabilities["relay"] {
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "relay.routes", Description: "List persisted relay routes"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+			routes, err := m.service.RelayRoutes(mcpCtx(ctx))
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, map[string]any{"routes": routes}, nil
+		})
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "relay.open", Description: "Select an authorized one-hop relay route"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			Target           string `json:"target" jsonschema:"target host:port"`
+			TargetCapability string `json:"target_capability,omitempty" jsonschema:"tunnel, ssh or file"`
+		}) (*mcpsdk.CallToolResult, any, error) {
+			capability := policy.CapTunnel
+			switch strings.ToLower(input.TargetCapability) {
+			case "", "tunnel":
+				capability = policy.CapTunnel
+			case "ssh":
+				capability = policy.CapSSH
+			case "file":
+				capability = policy.CapFile
+			default:
+				return nil, nil, apperrors.New(apperrors.InvalidArgument, "unsupported target capability")
+			}
+			route, err := m.service.RelayOpen(mcpCtx(ctx), input.Target, capability)
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, route, nil
+		})
+	}
 }
 
 func (m *Manager) Handler() http.Handler {
@@ -223,13 +278,17 @@ func (m *Manager) Handler() http.Handler {
 
 func (m *Manager) Status() map[string]any {
 	settings := m.service.Settings()
+	capabilities := m.service.MCPCapabilities()
 	return map[string]any{
 		"enabled":    settings["mcp_enabled"] == "true",
-		"ssh":        settings["mcp_ssh"] == "true",
-		"file":       settings["mcp_file"] == "true",
-		"tunnel":     settings["mcp_tunnel"] == "true",
-		"screenshot": settings["mcp_screenshot"] == "true",
-		"mouse":      settings["mcp_mouse"] == "true",
+		"ssh":        capabilities["ssh"],
+		"file":       capabilities["file"],
+		"tunnel":     capabilities["tunnel"],
+		"screenshot": capabilities["screenshot"],
+		"mouse":      capabilities["mouse"],
+		"discovery":  capabilities["discovery"],
+		"relay":      capabilities["relay"],
+		"bind_scope": settings["mcp_bind_scope"],
 		"endpoint":   "http://127.0.0.1:56701/mcp",
 	}
 }

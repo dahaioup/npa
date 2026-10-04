@@ -8,7 +8,8 @@
 *.dll
 *.so
 *.dylib
-npa
+# 根目录下的 npa 可执行文件（锚定根路径，避免误伤 cmd/npa 源码目录）
+/npa
 
 # Test binary, built with `go test -c`
 *.test
@@ -18,6 +19,7 @@ npa
 
 # NPA local runtime state
 .npa/
+dist/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -28,3 +30,6 @@ go.work.sum
 
 # env file
 .env
+
+# macOS
+.DS_Store

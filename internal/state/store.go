@@ -27,6 +27,8 @@ var (
 	credentialsBucket = []byte("credentials")
 	tunnelsBucket     = []byte("tunnels")
 	auditBucket       = []byte("audit")
+	discoveredBucket  = []byte("discovered_nodes")
+	relayBucket       = []byte("relay_routes")
 	metaBucket        = []byte("meta")
 	auditSeqKey       = []byte("audit_sequence")
 )
@@ -91,7 +93,7 @@ func loadOrCreateKey(path string) ([]byte, error) {
 
 func (s *Store) initialize() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{settingsBucket, nodesBucket, credentialsBucket, tunnelsBucket, auditBucket, metaBucket} {
+		for _, name := range [][]byte{settingsBucket, nodesBucket, credentialsBucket, tunnelsBucket, auditBucket, discoveredBucket, relayBucket, metaBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -123,6 +125,10 @@ func defaults() map[string]string {
 		"mcp_tunnel":           "false",
 		"mcp_screenshot":       "false",
 		"mcp_mouse":            "false",
+		"mcp_discovery":        "false",
+		"mcp_relay":            "false",
+		"mcp_bind_scope":       "loopback",
+		"discovery_enabled":    "false",
 		"allow_public_targets": "false",
 		"log_level":            "info",
 		"audit_retention_days": "30",
@@ -394,6 +400,74 @@ func (s *Store) DeleteTunnel(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(tunnelsBucket).Delete([]byte(id)) })
+}
+
+func (s *Store) ListDiscoveredNodes() ([]model.Node, error) {
+	nodes := []model.Node{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(discoveredBucket).ForEach(func(_, value []byte) error {
+			var node model.Node
+			if err := json.Unmarshal(value, &node); err != nil {
+				return err
+			}
+			nodes = append(nodes, node)
+			return nil
+		})
+	})
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
+	return nodes, err
+}
+
+func (s *Store) SaveDiscoveredNode(node model.Node) error {
+	if node.ID == "" {
+		return apperrors.New(apperrors.InvalidArgument, "discovered node id is required")
+	}
+	node.Discovered = true
+	node.UpdatedAt = time.Now().UTC()
+	if node.LastSeen.IsZero() {
+		node.LastSeen = node.UpdatedAt
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error { return writeJSON(tx.Bucket(discoveredBucket), []byte(node.ID), node) })
+}
+
+func (s *Store) DeleteDiscoveredNode(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(discoveredBucket).Delete([]byte(id)) })
+}
+
+func (s *Store) ListRelayRoutes() ([]model.RelayRoute, error) {
+	routes := []model.RelayRoute{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(relayBucket).ForEach(func(_, value []byte) error {
+			var route model.RelayRoute
+			if err := json.Unmarshal(value, &route); err != nil {
+				return err
+			}
+			routes = append(routes, route)
+			return nil
+		})
+	})
+	return routes, err
+}
+
+func (s *Store) SaveRelayRoute(route model.RelayRoute) error {
+	if route.TargetSubnet == "" || route.ViaNodeID == "" {
+		return apperrors.New(apperrors.InvalidArgument, "relay route target and node are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return writeJSON(tx.Bucket(relayBucket), []byte(route.TargetSubnet+"|"+route.ViaNodeID), route)
+	})
+}
+
+func (s *Store) DeleteRelayRoute(targetSubnet, viaNodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(relayBucket).Delete([]byte(targetSubnet + "|" + viaNodeID)) })
 }
 
 func (s *Store) AddAudit(event model.AuditEvent) (model.AuditEvent, error) {

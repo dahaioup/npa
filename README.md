@@ -8,9 +8,11 @@ NPA (Node Proxy Agent) 是一款专为局域网多机联调与 AI 自动化排�
 
 当前仓库已实现一期核心能力：
 
-- 单二进制启动，Web 固定监听 `127.0.0.1:56700`，MCP 固定监听 `127.0.0.1:56701`；
+- 单二进制启动，Web 固定监听 `127.0.0.1:56700`；MCP 默认监听 `127.0.0.1:56701`，可在设置中切换为局域网范围；
+- MCP 监听范围位于权限层级中；仅本机范围时，节点发现和中继 MCP 权限不可开启。
 - Web 管理概览、节点拓扑占位、SSH 交互式终端、Local/Remote/SOCKS5 隧道、设置（含 MCP 权限）和审计；
 - 节点页默认展示本地节点，不提供手工添加入口；三期 Discovery 接入后在此展示自动发现节点拓扑，点击节点查看详情；
+- 节点 ID 从本机 MAC 地址稳定派生为 8 位 `0-9A-Z` 字符，并同步用于 mDNS TXT；
 - SSH 页面只保留交互式终端，默认选择本地节点并在本地 shell 中执行命令；
 - 节点、隧道、设置、审计和加密凭据保存在内部 bbolt 状态库，不维护用户配置文件；
 - MCP 使用官方 Go SDK，默认只注册 `nodes.list`；SSH、File、Tunnel Capability 默认关闭并可在设置页即时开关；
@@ -36,6 +38,20 @@ NPA (Node Proxy Agent) 是一款专为局域网多机联调与 AI 自动化排�
 - Core 继续保持 `CGO_ENABLED=0`，平台能力通过插件或脚本回退隔离。
 
 macOS 截图需要系统“屏幕录制”权限；未授权时工具会返回明确错误，不会导致 Core 崩溃。
+
+## Phase 3 — NPA Mesh
+
+当前已加入三期基础能力：
+
+- 标准 mDNS/DNS-SD `_npa._tcp.local.` 发现，固定使用 `5353/UDP`，不增加 NPA 私有发现端口；
+- Discovery 可在设置中独立开关，关闭时不广播；
+- TXT 仅发布节点 ID、名称、版本、入口、Capability 和可达子网摘要，不包含凭据；
+- 自动汇总 RFC1918、回环和链路本地 `reachable_subnets`；
+- 单跳 Relay 路由选择，优先直连，再选择已信任且显式启用 Relay 的健康节点；
+- Relay 数据面复用 SSH `direct-tcpip`，不创建私有协议；
+- Web 节点拓扑显示本地、已管理与已发现节点，并展示可达子网和 Relay 路径；
+- MCP 新增 `discovery.nodes`、`discovery.refresh`、`network.subnets`、`relay.routes`、`relay.open`；
+- Discovery 与 Relay MCP Capability 默认关闭并独立审计。
 
 ## 构建与运行
 

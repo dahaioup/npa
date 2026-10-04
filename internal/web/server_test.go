@@ -40,4 +40,20 @@ func TestEmbeddedWebAndSettings(t *testing.T) {
 	if settings["mcp_ssh"] != "false" || settings["mcp_file"] != "false" || settings["mcp_tunnel"] != "false" {
 		t.Fatalf("MCP capabilities must default off: %#v", settings)
 	}
+	if settings["discovery_enabled"] != "false" || settings["mcp_discovery"] != "false" || settings["mcp_relay"] != "false" {
+		t.Fatalf("mesh capabilities must default off: %#v", settings)
+	}
+	if settings["mcp_bind_scope"] != "loopback" {
+		t.Fatalf("MCP must default to loopback scope: %#v", settings)
+	}
+	for _, path := range []string{"/api/discovery", "/api/network/subnets", "/api/relay/routes"} {
+		response, err := http.Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s returned %d", path, response.StatusCode)
+		}
+		response.Body.Close()
+	}
 }

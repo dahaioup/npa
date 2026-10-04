@@ -25,6 +25,14 @@ func TestStorePersistsEncryptedCredentials(t *testing.T) {
 	if err := store.SaveTunnel(tunnel); err != nil {
 		t.Fatal(err)
 	}
+	discovered := model.Node{ID: "peer-1", Name: "peer", Address: "192.168.1.20", Port: 56700, AuthMethod: "discovered", Protocol: "discovered", Status: "discovered", ReachableSubnets: []string{"192.168.2.0/24"}}
+	if err := store.SaveDiscoveredNode(discovered); err != nil {
+		t.Fatal(err)
+	}
+	route := model.RelayRoute{TargetSubnet: "192.168.2.0/24", ViaNodeID: "peer-1", Hops: []string{"peer-1"}, Healthy: true}
+	if err := store.SaveRelayRoute(route); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -54,5 +62,13 @@ func TestStorePersistsEncryptedCredentials(t *testing.T) {
 	savedTunnel, err := reopened.GetTunnel(tunnel.ID)
 	if err != nil || !savedTunnel.AutoStart || savedTunnel.TargetPort != 8080 {
 		t.Fatalf("tunnel was not restored: %#v, %v", savedTunnel, err)
+	}
+	discoveredNodes, err := reopened.ListDiscoveredNodes()
+	if err != nil || len(discoveredNodes) != 1 || !discoveredNodes[0].Discovered {
+		t.Fatalf("discovered node was not restored: %#v, %v", discoveredNodes, err)
+	}
+	routes, err := reopened.ListRelayRoutes()
+	if err != nil || len(routes) != 1 || routes[0].ViaNodeID != "peer-1" {
+		t.Fatalf("relay route was not restored: %#v, %v", routes, err)
 	}
 }
