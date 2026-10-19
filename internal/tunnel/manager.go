@@ -36,6 +36,12 @@ type Manager struct {
 	mu              sync.Mutex
 	runtime         map[string]*runtimeState
 	TargetValidator func(host string, port int) error
+	// DialTarget 由 service 注入，用于让 peer 节点（反向链路）也能承载 Local/SOCKS 转发；
+	// 未注入时退回 SSH direct-tcpip。
+	DialTarget func(ctx context.Context, nodeID, address string) (net.Conn, error)
+	// IsPeer 判断节点是否为反向接入（peer）节点：它的连接由它主动建立，
+	// 没有 SSH 服务端，启动 local/socks 隧道时不应尝试建立 SSH 客户端。
+	IsPeer func(nodeID string) bool
 }
 
 func NewManager(repo Repository, sshManager *sshx.Manager) *Manager {
@@ -95,25 +101,42 @@ func (m *Manager) Start(ctx context.Context, id string) (model.Tunnel, error) {
 		return tunnel, nil
 	}
 	m.mu.Unlock()
-	sshClient, err := m.ssh.Client(ctx, tunnel.NodeID)
-	if err != nil {
-		_ = m.repo.UpdateTunnelStatus(id, "error", err.Error())
-		return tunnel, err
-	}
-
-	listenAddress := listenHostPort(tunnel.ListenAddress, tunnel.ListenPort)
-	var listener net.Listener
-	var remoteListener interface {
-		Accept() (net.Conn, error)
-		Close() error
-		Addr() net.Addr
-	}
-	if tunnel.Type == "remote" {
-		remoteListener, err = sshClient.Listen("tcp", listenAddress)
-		if err == nil {
-			listener = remoteListener
+	isPeer := m.IsPeer != nil && m.IsPeer(tunnel.NodeID)
+	var (
+		sshClient interface {
+			Dial(network, addr string) (net.Conn, error)
+			Listen(network, laddr string) (net.Listener, error)
 		}
+		listener net.Listener
+	)
+	listenAddress := listenHostPort(tunnel.ListenAddress, tunnel.ListenPort)
+
+	if tunnel.Type == "remote" {
+		// 反向隧道要在**节点上**监听，需要节点侧有 SSH 服务端；peer 节点没有。
+		if isPeer {
+			err := apperrors.New(apperrors.NotSupported,
+				"peer 节点没有 SSH 服务端，不支持反向隧道；请改用端口映射或 Local/SOCKS 隧道")
+			_ = m.repo.UpdateTunnelStatus(id, "error", err.Error())
+			return tunnel, err
+		}
+		client, clientErr := m.ssh.Client(ctx, tunnel.NodeID)
+		if clientErr != nil {
+			_ = m.repo.UpdateTunnelStatus(id, "error", clientErr.Error())
+			return tunnel, clientErr
+		}
+		sshClient = client
+		listener, err = client.Listen("tcp", listenAddress)
 	} else {
+		// Local / SOCKS 的数据面走 DialTarget（peer 节点经反向链路），
+		// 但非 peer 节点仍先建立 SSH 连接，保持"启动即校验"的快速失败反馈。
+		if !isPeer {
+			client, clientErr := m.ssh.Client(ctx, tunnel.NodeID)
+			if clientErr != nil {
+				_ = m.repo.UpdateTunnelStatus(id, "error", clientErr.Error())
+				return tunnel, clientErr
+			}
+			sshClient = client
+		}
 		listener, err = net.Listen("tcp", listenAddress)
 	}
 	if err != nil {
@@ -180,13 +203,7 @@ func (m *Manager) handleConnection(ctx context.Context, definition model.Tunnel,
 		pipe(inbound, local)
 		return
 	}
-	dialer := sshClient
-	if definition.Type != "remote" {
-		if fresh, clientErr := m.ssh.Client(ctx, definition.NodeID); clientErr == nil {
-			dialer = fresh
-		}
-	}
-	remote, err := dialer.Dial("tcp", net.JoinHostPort(definition.TargetHost, strconv.Itoa(definition.TargetPort)))
+	remote, err := m.dialTarget(ctx, definition.NodeID, net.JoinHostPort(definition.TargetHost, strconv.Itoa(definition.TargetPort)))
 	if err != nil {
 		_ = m.repo.UpdateTunnelStatus(definition.ID, "error", err.Error())
 		m.ssh.Close(definition.NodeID)
@@ -253,11 +270,7 @@ func (m *Manager) handleSOCKS(ctx context.Context, definition model.Tunnel, conn
 			return
 		}
 	}
-	dialer := sshClient
-	if fresh, clientErr := m.ssh.Client(ctx, definition.NodeID); clientErr == nil {
-		dialer = fresh
-	}
-	remote, err := dialer.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	remote, err := m.dialTarget(ctx, definition.NodeID, net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err != nil {
 		_, _ = conn.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
 		return
@@ -267,6 +280,18 @@ func (m *Manager) handleSOCKS(ctx context.Context, definition model.Tunnel, conn
 		return
 	}
 	pipe(conn, remote)
+}
+
+// dialTarget 经指定节点拨号；注入的 DialTarget 让 peer 节点同样可用。
+func (m *Manager) dialTarget(ctx context.Context, nodeID, address string) (net.Conn, error) {
+	if m.DialTarget != nil {
+		return m.DialTarget(ctx, nodeID, address)
+	}
+	client, err := m.ssh.Client(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return client.Dial("tcp", address)
 }
 
 func pipe(left, right net.Conn) {

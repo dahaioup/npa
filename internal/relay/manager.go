@@ -20,20 +20,42 @@ import (
 var ErrNoRoute = errors.New("no authorized relay route")
 
 type Repository interface {
+	GetNode(id string) (model.Node, error)
 	ListNodes() ([]model.Node, error)
 	ListDiscoveredNodes() ([]model.Node, error)
 	ListRelayRoutes() ([]model.RelayRoute, error)
 	SaveRelayRoute(route model.RelayRoute) error
 }
 
+// PeerDialer 是反向链路的数据面（由 peer.Hub 实现）；
+// via 取 direct（对端直连目标）或 ssh:<nodeID>（经对端的 SSH 客户端转发）。
+type PeerDialer interface {
+	Dial(ctx context.Context, nodeID, target, via string) (net.Conn, error)
+	Online(nodeID string) bool
+}
+
 type Manager struct {
 	repo Repository
 	ssh  *sshx.Manager
+	peer PeerDialer
 	mu   sync.Mutex
 }
 
 func NewManager(repo Repository, sshManager *sshx.Manager) *Manager {
 	return &Manager{repo: repo, ssh: sshManager}
+}
+
+// SetPeerDialer 注入反向链路数据面；未注入时 peer 节点不可用（退化为 SSH/直连）。
+func (m *Manager) SetPeerDialer(dialer PeerDialer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peer = dialer
+}
+
+func (m *Manager) peerDialer() PeerDialer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.peer
 }
 
 func targetAddress(target string) (string, int, error) {
@@ -97,57 +119,181 @@ func (m *Manager) Select(ctx context.Context, target string) (model.RelayRoute, 
 	if err != nil {
 		return model.RelayRoute{}, err
 	}
+	now := time.Now().UTC()
 	if isDirect(ctx, ip) {
-		return model.RelayRoute{TargetSubnet: ip.String() + "/32", ViaNodeID: "direct", Hops: []string{}, Healthy: true, LastChecked: time.Now().UTC()}, nil
+		return model.RelayRoute{
+			TargetSubnet: ip.String() + "/32", ViaNodeID: "direct",
+			Hops: []string{}, Healthy: true, LastChecked: now,
+		}, nil
 	}
+
 	nodes, err := m.repo.ListNodes()
 	if err != nil {
 		return model.RelayRoute{}, err
 	}
-	var selected *model.RelayRoute
+	dialer := m.peerDialer()
+
+	var peerNodes, sshNodes []model.Node
 	for _, node := range nodes {
-		if !node.Trusted || !node.RelayEnabled || node.Status != "connected" {
+		if !node.Trusted || !node.RelayEnabled {
 			continue
 		}
-		for _, subnet := range node.ReachableSubnets {
-			if !isPrivateSubnet(subnet) {
+		if node.Protocol == "peer" {
+			if dialer == nil || !dialer.Online(node.ID) {
 				continue
 			}
-			if !subnetContains(subnet, ip) {
+			peerNodes = append(peerNodes, node)
+			continue
+		}
+		if node.Status == "connected" {
+			sshNodes = append(sshNodes, node)
+		}
+	}
+
+	declaredBy := func(subnets []string) (string, bool) {
+		for _, subnet := range subnets {
+			if isPrivateSubnet(subnet) && subnetContains(subnet, ip) {
+				return subnet, true
+			}
+		}
+		return "", false
+	}
+	route := func(subnet, via string, hops ...string) model.RelayRoute {
+		selected := model.RelayRoute{TargetSubnet: subnet, ViaNodeID: via, Hops: hops, Healthy: true, LastChecked: now}
+		_ = m.repo.SaveRelayRoute(selected) // 保留选路结果，供 relay.routes 展示
+		return selected
+	}
+
+	// 1) peer 自己宣告该子网：走反向链路，由 peer 直接拨目标
+	for _, node := range peerNodes {
+		if subnet, ok := declaredBy(node.ReachableSubnets); ok {
+			return route(subnet, node.ID, node.ID), nil
+		}
+	}
+	// 2) 本机已纳管的 SSH 节点宣告该子网：不需要反向链路
+	for _, node := range sshNodes {
+		if subnet, ok := declaredBy(node.ReachableSubnets); ok {
+			return route(subnet, node.ID, node.ID), nil
+		}
+	}
+	// 3) peer 对端的 SSH 跳板宣告该子网：NPA 映射 + SSH 映射串联
+	for _, node := range peerNodes {
+		for _, remote := range node.PeerRoutes {
+			if !remote.Trusted || !remote.RelayEnabled {
 				continue
 			}
-			route := model.RelayRoute{
-				TargetSubnet: subnet, ViaNodeID: node.ID, Hops: []string{node.ID},
-				Healthy: true, LastChecked: time.Now().UTC(),
-			}
-			if selected == nil || len(route.Hops) < len(selected.Hops) {
-				candidate := route
-				selected = &candidate
+			if subnet, ok := declaredBy(remote.Subnets); ok {
+				return route(subnet, node.ID, node.ID, remote.NodeID), nil
 			}
 		}
 	}
-	if selected == nil {
-		return model.RelayRoute{}, apperrors.New(apperrors.TargetForbidden, ErrNoRoute.Error())
+	// 4) 兜底：私网目标但没有宣告匹配的子网，交给在线 peer 试拨（可达性以实际拨号为准）
+	if ip.IsPrivate() {
+		for _, node := range peerNodes {
+			return route(ip.String()+"/32", node.ID, node.ID), nil
+		}
 	}
-	if err := m.repo.SaveRelayRoute(*selected); err != nil {
-		return *selected, err
-	}
-	return *selected, nil
+	return model.RelayRoute{}, apperrors.New(apperrors.TargetForbidden, ErrNoRoute.Error())
 }
 
-func (m *Manager) Dial(ctx context.Context, target string) (net.Conn, error) {
+// DialRoute 选路并拨号到目标，同时返回所选路径，供需要展示"经由谁"的调用方使用。
+func (m *Manager) DialRoute(ctx context.Context, target string) (net.Conn, model.RelayRoute, error) {
 	route, err := m.Select(ctx, target)
 	if err != nil {
-		return nil, err
+		return nil, route, err
 	}
 	if route.ViaNodeID == "direct" {
 		host, port, err := targetAddress(target)
 		if err != nil {
-			return nil, err
+			return nil, route, err
 		}
-		return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			return nil, route, apperrors.Wrap(apperrors.TargetForbidden, "direct dial failed", err)
+		}
+		return conn, route, nil
 	}
-	client, err := m.ssh.Client(ctx, route.ViaNodeID)
+	conn, err := m.dialHops(ctx, route, target)
+	return conn, route, err
+}
+
+// dialHops 按跳数依次执行：首跳是 peer 节点就走反向链路，
+// 第二跳若是对端 SSH 节点，则用 via=ssh:<nodeID> 让对端再经 SSH 转发（NPA 映射 + SSH 映射）。
+func (m *Manager) dialHops(ctx context.Context, route model.RelayRoute, target string) (net.Conn, error) {
+	if len(route.Hops) == 0 {
+		return nil, apperrors.New(apperrors.TargetForbidden, ErrNoRoute.Error())
+	}
+	entry := route.Hops[0]
+	if !m.isPeerNode(entry) {
+		return m.dialNode(ctx, entry, target)
+	}
+	dialer := m.peerDialer()
+	if dialer == nil {
+		return nil, apperrors.New(apperrors.NotSupported, "反向链路未启用")
+	}
+	via := "direct"
+	if len(route.Hops) >= 2 {
+		via = "ssh:" + route.Hops[1]
+	}
+	return dialer.Dial(ctx, entry, target, via)
+}
+
+func (m *Manager) isPeerNode(nodeID string) bool {
+	node, err := m.repo.GetNode(nodeID)
+	if err != nil {
+		return false
+	}
+	return node.Protocol == "peer"
+}
+
+// DialNode 经指定节点转发到目标：peer 节点走反向链路，其余走 SSH direct-tcpip。
+// 返回值携带所经节点，供端口映射等调用方展示"经由谁"。
+func (m *Manager) DialNode(ctx context.Context, nodeID, target string) (net.Conn, model.RelayRoute, error) {
+	route := model.RelayRoute{ViaNodeID: nodeID, Hops: []string{nodeID}, Healthy: true, LastChecked: time.Now().UTC()}
+	if m.isPeerNode(nodeID) {
+		dialer := m.peerDialer()
+		if dialer == nil {
+			return nil, route, apperrors.New(apperrors.NotSupported, "反向链路未启用")
+		}
+		conn, err := dialer.Dial(ctx, nodeID, target, "direct")
+		if err != nil {
+			return nil, route, err
+		}
+		return conn, route, nil
+	}
+	conn, err := m.dialNode(ctx, nodeID, target)
+	if err != nil {
+		return nil, route, err
+	}
+	return conn, route, nil
+}
+
+func (m *Manager) dialNode(ctx context.Context, nodeID, target string) (net.Conn, error) {
+	if m.isPeerNode(nodeID) {
+		dialer := m.peerDialer()
+		if dialer == nil {
+			return nil, apperrors.New(apperrors.NotSupported, "反向链路未启用")
+		}
+		return dialer.Dial(ctx, nodeID, target, "direct")
+	}
+	nodes, err := m.repo.ListNodes()
+	if err != nil {
+		return nil, err
+	}
+	var selected *model.Node
+	for i := range nodes {
+		if nodes[i].ID == nodeID {
+			selected = &nodes[i]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, apperrors.New(apperrors.InvalidArgument, "relay node is not managed: "+nodeID)
+	}
+	if !selected.Trusted || !selected.RelayEnabled {
+		return nil, apperrors.New(apperrors.TargetForbidden, "relay node is not authorized: "+nodeID)
+	}
+	client, err := m.ssh.Client(ctx, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -158,13 +304,33 @@ func (m *Manager) Dial(ctx context.Context, target string) (net.Conn, error) {
 	return conn, nil
 }
 
+func (m *Manager) Dial(ctx context.Context, target string) (net.Conn, error) {
+	conn, _, err := m.DialRoute(ctx, target)
+	return conn, err
+}
+
 func (m *Manager) Routes() ([]model.RelayRoute, error) {
 	return m.repo.ListRelayRoutes()
+}
+
+// relayTargetPrefix 判断该前缀是否可能作为中继目标：
+// 回环（127/8、::1）与链路本地（fe80::/10、169.254/16）永远不是跨设备转发对象，
+// 展示与 MCP 都应过滤，避免把本机地址误读成"节点 IP"。
+func relayTargetPrefix(prefix string) bool {
+	parsed, err := netip.ParsePrefix(prefix)
+	if err != nil {
+		return false
+	}
+	addr := parsed.Addr()
+	return !addr.IsLoopback() && !addr.IsLinkLocalUnicast() && !addr.IsLinkLocalMulticast()
 }
 
 func (m *Manager) Subnets(ctx context.Context) ([]model.SubnetInfo, error) {
 	result := []model.SubnetInfo{}
 	for _, subnet := range discovery.LocalSubnets() {
+		if !relayTargetPrefix(subnet) {
+			continue
+		}
 		result = append(result, model.SubnetInfo{Source: "local", Prefix: subnet})
 	}
 	managed, err := m.repo.ListNodes()
@@ -173,7 +339,7 @@ func (m *Manager) Subnets(ctx context.Context) ([]model.SubnetInfo, error) {
 	}
 	for _, node := range managed {
 		for _, subnet := range node.ReachableSubnets {
-			if isPrivateSubnet(subnet) {
+			if isPrivateSubnet(subnet) && relayTargetPrefix(subnet) {
 				result = append(result, model.SubnetInfo{Source: "managed", NodeID: node.ID, Prefix: subnet})
 			}
 		}
@@ -184,7 +350,7 @@ func (m *Manager) Subnets(ctx context.Context) ([]model.SubnetInfo, error) {
 	}
 	for _, node := range nodes {
 		for _, subnet := range node.ReachableSubnets {
-			if isPrivateSubnet(subnet) {
+			if isPrivateSubnet(subnet) && relayTargetPrefix(subnet) {
 				result = append(result, model.SubnetInfo{Source: "discovered", NodeID: node.ID, Prefix: subnet})
 			}
 		}

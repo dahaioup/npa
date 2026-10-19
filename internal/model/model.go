@@ -3,26 +3,32 @@ package model
 import "time"
 
 type Node struct {
-	ID                 string    `json:"id"`
-	DisplayID          string    `json:"display_id,omitempty"`
-	Name               string    `json:"name"`
-	Address            string    `json:"address"`
-	Port               int       `json:"port"`
-	Username           string    `json:"username"`
-	AuthMethod         string    `json:"auth_method"`
-	Protocol           string    `json:"protocol"`
-	Tags               []string  `json:"tags"`
-	Status             string    `json:"status"`
-	LastError          string    `json:"last_error,omitempty"`
-	HostKeyFingerprint string    `json:"host_key_fingerprint,omitempty"`
-	ReachableSubnets   []string  `json:"reachable_subnets,omitempty"`
-	Capabilities       []string  `json:"capabilities,omitempty"`
-	RelayEnabled       bool      `json:"relay_enabled"`
-	Trusted            bool      `json:"trusted"`
-	Discovered         bool      `json:"discovered"`
-	LastSeen           time.Time `json:"last_seen,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 string   `json:"id"`
+	DisplayID          string   `json:"display_id,omitempty"`
+	Name               string   `json:"name"`
+	Address            string   `json:"address"`
+	Port               int      `json:"port"`
+	Username           string   `json:"username"`
+	AuthMethod         string   `json:"auth_method"`
+	Protocol           string   `json:"protocol"`
+	Tags               []string `json:"tags"`
+	Status             string   `json:"status"`
+	LastError          string   `json:"last_error,omitempty"`
+	HostKeyFingerprint string   `json:"host_key_fingerprint,omitempty"`
+	ReachableSubnets   []string `json:"reachable_subnets,omitempty"`
+	Capabilities       []string `json:"capabilities,omitempty"`
+	RelayEnabled       bool     `json:"relay_enabled"`
+	Trusted            bool     `json:"trusted"`
+	Discovered         bool     `json:"discovered"`
+	// Registered 表示该节点是主动向上级注册的反向接入（peer）节点；
+	// 它由子网侧主动建立长连接，上级通过该链路反向联系它。
+	Registered bool   `json:"registered,omitempty"`
+	PeerSource string `json:"peer_source,omitempty"` // seed | probe | manual
+	// PeerRoutes 是该 peer 节点**对端**已纳管的 SSH 跳板，用于「NPA 映射 + SSH 映射」串联。
+	PeerRoutes []RemoteRoute `json:"peer_routes,omitempty"`
+	LastSeen   time.Time     `json:"last_seen,omitempty"`
+	CreatedAt  time.Time     `json:"created_at"`
+	UpdatedAt  time.Time     `json:"updated_at"`
 }
 
 type Credential struct {
@@ -44,6 +50,25 @@ type Tunnel struct {
 	AutoStart     bool      `json:"auto_start"`
 	Status        string    `json:"status"`
 	LastError     string    `json:"last_error,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// PortMapping 是 NPA 自带的端口映射：本机监听端口，把入站连接转发到子网内的目标 IP:端口，
+// 转发路径由 relay 选路（直连或经已纳管节点中继），与 SSH 隧道相互独立。
+type PortMapping struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	TargetHost    string    `json:"target_host"`
+	TargetPort    int       `json:"target_port"`
+	ListenAddress string    `json:"listen_address"`
+	ListenPort    int       `json:"listen_port"`
+	ViaNodeID     string    `json:"via_node_id,omitempty"`
+	AutoStart     bool      `json:"auto_start"`
+	Status        string    `json:"status"`
+	LastError     string    `json:"last_error,omitempty"`
+	RuntimePort   int       `json:"runtime_port,omitempty"`
+	ViaRoute      string    `json:"via_route,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -90,6 +115,14 @@ type SubnetInfo struct {
 	Source string `json:"source"`
 	NodeID string `json:"node_id,omitempty"`
 	Prefix string `json:"prefix"`
+}
+
+// RemoteRoute 描述对端可作为跳板的 SSH 节点及其宣告子网。
+type RemoteRoute struct {
+	NodeID       string   `json:"node_id"`
+	Subnets      []string `json:"subnets"`
+	Trusted      bool     `json:"trusted"`
+	RelayEnabled bool     `json:"relay_enabled"`
 }
 
 type RelayRoute struct {

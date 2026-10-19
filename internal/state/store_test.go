@@ -72,3 +72,48 @@ func TestStorePersistsEncryptedCredentials(t *testing.T) {
 		t.Fatalf("relay route was not restored: %#v, %v", routes, err)
 	}
 }
+
+func TestStorePersistsPortMappings(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapping := model.PortMapping{
+		ID: "map-1", Name: "RustDesk", TargetHost: "192.168.50.21", TargetPort: 21115,
+		ListenPort: 21115, AutoStart: true,
+	}
+	if err := store.SavePortMapping(mapping); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdatePortMappingStatus(mapping.ID, "running", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.GetPortMapping(mapping.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TargetHost != mapping.TargetHost || got.TargetPort != 21115 || got.ListenAddress != "127.0.0.1" || !got.AutoStart || got.Status != "running" {
+		t.Fatalf("port mapping was not restored: %#v", got)
+	}
+	if err := reopened.SavePortMapping(model.PortMapping{ID: "bad", Name: "bad", TargetHost: "192.168.50.21", TargetPort: 70000}); err == nil {
+		t.Fatal("invalid target port must be rejected")
+	}
+	if err := reopened.SavePortMapping(model.PortMapping{ID: "bad2", Name: "bad", TargetHost: "192.168.50.21", TargetPort: 80, ListenAddress: "10.0.0.1"}); err == nil {
+		t.Fatal("arbitrary listen address must be rejected")
+	}
+	if err := reopened.DeletePortMapping(mapping.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.GetPortMapping(mapping.ID); err == nil {
+		t.Fatal("port mapping must be removed")
+	}
+}

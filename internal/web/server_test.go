@@ -1,11 +1,13 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/npa/npa/internal/model"
 	"github.com/npa/npa/internal/service"
 	"github.com/npa/npa/internal/state"
 )
@@ -37,14 +39,20 @@ func TestEmbeddedWebAndSettings(t *testing.T) {
 		t.Fatalf("embedded UI did not load: %q", string(buf[:n]))
 	}
 	settings := app.Settings()
-	if settings["mcp_ssh"] != "false" || settings["mcp_file"] != "false" || settings["mcp_tunnel"] != "false" {
-		t.Fatalf("MCP capabilities must default off: %#v", settings)
+	// 调试期默认：MCP 与 Discovery 能力全开、MCP 走局域网；Web 管理面仍固定回环。
+	if settings["mcp_ssh"] != "true" || settings["mcp_file"] != "true" || settings["mcp_tunnel"] != "true" {
+		t.Fatalf("MCP capabilities must default on for debugging: %#v", settings)
 	}
-	if settings["discovery_enabled"] != "false" || settings["mcp_discovery"] != "false" || settings["mcp_relay"] != "false" {
-		t.Fatalf("mesh capabilities must default off: %#v", settings)
+	if settings["discovery_enabled"] != "true" || settings["mcp_discovery"] != "true" || settings["mcp_relay"] != "true" {
+		t.Fatalf("mesh capabilities must default on for debugging: %#v", settings)
 	}
-	if settings["mcp_bind_scope"] != "loopback" {
-		t.Fatalf("MCP must default to loopback scope: %#v", settings)
+	if settings["mcp_bind_scope"] != "lan" {
+		t.Fatalf("MCP must default to lan scope for debugging: %#v", settings)
+	}
+	for _, key := range []string{"peer_enabled", "peer_bind_scope", "peer_port", "peer_pool_size"} {
+		if settings[key] == "" {
+			t.Fatalf("missing peer setting default %s: %#v", key, settings)
+		}
 	}
 	for _, path := range []string{"/api/discovery", "/api/network/subnets", "/api/relay/routes"} {
 		response, err := http.Get(server.URL + path)
@@ -55,5 +63,107 @@ func TestEmbeddedWebAndSettings(t *testing.T) {
 			t.Fatalf("%s returned %d", path, response.StatusCode)
 		}
 		response.Body.Close()
+	}
+}
+
+func TestPortMappingLifecycle(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	app := service.New(store)
+	server := httptest.NewServer(New(app, fakeMCP{}).Handler())
+	defer server.Close()
+	defer app.Close()
+
+	body := `{"name":"RustDesk","target_host":"192.168.50.21","target_port":21115,"listen_address":"127.0.0.1","listen_port":0,"auto_start":true}`
+	response, err := http.Post(server.URL+"/api/portmappings", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create returned %d", response.StatusCode)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" {
+		t.Fatal("mapping id must be assigned")
+	}
+	started, err := http.Post(server.URL+"/api/portmappings/"+created.ID+"/start", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var running map[string]any
+	if err := json.NewDecoder(started.Body).Decode(&running); err != nil {
+		t.Fatal(err)
+	}
+	started.Body.Close()
+	if started.StatusCode != http.StatusOK {
+		t.Fatalf("start returned %d (%v)", started.StatusCode, running)
+	}
+	if running["status"] != "running" {
+		t.Fatalf("mapping must be running: %#v", running)
+	}
+	listResponse, err := http.Get(server.URL + "/api/portmappings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mappings []model.PortMapping
+	if err := json.NewDecoder(listResponse.Body).Decode(&mappings); err != nil {
+		t.Fatal(err)
+	}
+	listResponse.Body.Close()
+	if len(mappings) != 1 || mappings[0].Status != "running" || mappings[0].RuntimePort == 0 {
+		t.Fatalf("unexpected mappings: %#v", mappings)
+	}
+	stopped, err := http.Post(server.URL+"/api/portmappings/"+created.ID+"/stop", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped.Body.Close()
+	if stopped.StatusCode != http.StatusOK {
+		t.Fatalf("stop returned %d", stopped.StatusCode)
+	}
+	deleted, err := http.NewRequest(http.MethodDelete, server.URL+"/api/portmappings/"+created.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.DefaultClient.Do(deleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("delete returned %d", response.StatusCode)
+	}
+	if _, err := store.GetPortMapping(created.ID); err == nil {
+		t.Fatal("mapping must be removed from the store")
+	}
+}
+
+func TestPortMappingRejectsPublicTarget(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	app := service.New(store)
+	server := httptest.NewServer(New(app, fakeMCP{}).Handler())
+	defer server.Close()
+	defer app.Close()
+	body := `{"name":"bad","target_host":"8.8.8.8","target_port":53,"listen_port":0}`
+	response, err := http.Post(server.URL+"/api/portmappings", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("public target must be rejected, got %d", response.StatusCode)
 	}
 }

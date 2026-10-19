@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +19,19 @@ import (
 	apperrors "github.com/npa/npa/internal/errors"
 	"github.com/npa/npa/internal/file"
 	"github.com/npa/npa/internal/model"
+	"github.com/npa/npa/internal/peer"
 	"github.com/npa/npa/internal/plugin"
 	"github.com/npa/npa/internal/policy"
+	"github.com/npa/npa/internal/portmap"
 	"github.com/npa/npa/internal/relay"
 	sshx "github.com/npa/npa/internal/ssh"
 	"github.com/npa/npa/internal/state"
 	"github.com/npa/npa/internal/tunnel"
+
+	"github.com/pkg/sftp"
 )
 
-const Version = "0.3.0-phase3"
+const Version = "0.3.1-phase3"
 
 type Service struct {
 	Store             *state.Store
@@ -37,6 +43,9 @@ type Service struct {
 	Plugin            *plugin.Manager
 	Discovery         *discovery.Manager
 	Relay             *relay.Manager
+	PortMappings      *portmap.Manager
+	Peer              *peer.Hub
+	PeerAgent         *peer.Agent
 	resourceDir       string
 	started           time.Time
 	mu                sync.RWMutex
@@ -62,12 +71,203 @@ func New(store *state.Store) *Service {
 	app.Desktop = desktop.NewRouterWithRoot(app.Plugin, resourceDir)
 	app.Discovery = discovery.NewManager(store, Version)
 	app.Relay = relay.NewManager(store, sshManager)
+	app.PortMappings = portmap.NewManager(store, app.Relay)
 	tunnelManager.TargetValidator = app.validateTarget
+	tunnelManager.DialTarget = app.DialNode // Local/SOCKS 隧道也能走 peer 反向链路
+	tunnelManager.IsPeer = func(nodeID string) bool { return app.isPeerNode(nodeID) }
+	fileService.IsPeer = func(nodeID string) bool { return app.isPeerNode(nodeID) }
+	// 必须用闭包延迟取值：wirePeer 在之后才创建 app.Peer
+	fileService.PeerFS = func(ctx context.Context, nodeID string) (*sftp.Client, func(), error) {
+		return app.Peer.FS(ctx, nodeID)
+	}
+	app.PortMappings.TargetValidator = app.validateTarget
+	app.wirePeer()
 	return app
 }
 
+// wirePeer 构造反向接入的上级 Hub 与下级 Agent；闭包在运行期读取设置，保证热生效。
+func (s *Service) wirePeer() {
+	hostname, _ := os.Hostname()
+	// 同一条错误可能每几秒重复（例如本机没有配置上级种子），
+	// 只在错误变化时打印一次，之后最多每 5 分钟提醒一次；完整错误仍通过 /api/peers 暴露。
+	var (
+		logMu        sync.Mutex
+		lastMessage  string
+		lastLoggedAt time.Time
+	)
+	logPeerError := func(err error) {
+		logMu.Lock()
+		shouldLog := err.Error() != lastMessage || time.Since(lastLoggedAt) >= 5*time.Minute
+		if shouldLog {
+			lastMessage, lastLoggedAt = err.Error(), time.Now()
+		}
+		logMu.Unlock()
+		if shouldLog {
+			slog.Warn("peer agent", "error", err)
+		}
+	}
+	s.Peer = peer.NewHub(s.Store, peer.Options{
+		Version: Version,
+		Name:    hostname,
+		Port: func() int {
+			return intSetting(s.Settings()["peer_port"], peer.DefaultPort)
+		},
+		Subnets:   discovery.LocalSubnets,
+		AutoTrust: func() bool { return parseBool(s.Settings()["peer_auto_trust"]) },
+		OnRegister: func(node model.Node) {
+			s.Audit.Record(context.Background(), "peer.register", node.ID, policy.CapBase,
+				audit.SafeParameters(map[string]string{"address": node.Address, "source": node.PeerSource, "subnets": strings.Join(node.ReachableSubnets, ",")}),
+				time.Now(), nil)
+		},
+	})
+	s.PeerAgent = peer.NewAgent(peer.AgentOptions{
+		Version: Version,
+		NodeID:  func() string { return model.NodeIDFromMAC() },
+		Name:    func() string { host, _ := os.Hostname(); return host },
+		Address: discovery.PrimaryIP,
+		Subnets: discovery.LocalSubnets,
+		Caps: func() []string {
+			return []string{"ssh", "file", "tunnel", "screenshot", "mouse", "discovery", "relay"}
+		},
+		PoolSize:     func() int { return intSetting(s.Settings()["peer_pool_size"], 4) },
+		Seeds:        func() string { return s.Settings()["peer_seeds"] },
+		ProbeSubnets: func() string { return s.Settings()["peer_probe_subnets"] },
+		Dial:         s.peerDial,
+		SSHRoutes:    s.sshRouteHints,
+		OnError:      logPeerError,
+	})
+	// relay 通过 peer 数据面访问反向接入的节点
+	s.Relay.SetPeerDialer(s.Peer)
+}
+
+// sshRouteHints 把本机已授权的 SSH 跳板上报给上级，
+// 使上级能在「节点无法直达 SSH 服务」时计算出 NPA 映射 + SSH 映射的串联路径。
+func (s *Service) sshRouteHints() []model.RemoteRoute {
+	nodes, err := s.Store.ListNodes()
+	if err != nil {
+		return nil
+	}
+	routes := []model.RemoteRoute{}
+	for _, node := range nodes {
+		if node.Protocol == "peer" || !node.Trusted || !node.RelayEnabled {
+			continue
+		}
+		if len(node.ReachableSubnets) == 0 {
+			continue
+		}
+		routes = append(routes, model.RemoteRoute{
+			NodeID: node.ID, Subnets: node.ReachableSubnets,
+			Trusted: node.Trusted, RelayEnabled: node.RelayEnabled,
+		})
+	}
+	return routes
+}
+
+// DialNode 是统一的目标拨号入口：peer 节点走反向链路，SSH 节点走 direct-tcpip。
+// 端口映射、隧道、Web 代理共用它，从而对上层透明。
+func (s *Service) DialNode(ctx context.Context, nodeID, target string) (net.Conn, error) {
+	if isLocalNodeID(nodeID) {
+		return nil, apperrors.New(apperrors.NotSupported, "本地节点不需要拨号")
+	}
+	conn, _, err := s.Relay.DialNode(ctx, nodeID, target)
+	return conn, err
+}
+
+func intSetting(raw string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+// isPeerNode 判断目标是否为反向接入节点（连接由它主动建立）。
+func (s *Service) isPeerNode(nodeID string) bool {
+	node, err := s.Store.GetNode(nodeID)
+	if err != nil {
+		return false
+	}
+	return node.Protocol == "peer"
+}
+
+// peerDial 实现「NPA 映射 + SSH 映射」的分段拨号：direct 由 NPA 自己转发，
+// ssh:<nodeID> 则经该节点的 SSH 客户端（direct-tcpip）转发。
+func (s *Service) peerDial(ctx context.Context, target, via string) (net.Conn, error) {
+	if via == "" || via == "direct" {
+		dialer := net.Dialer{Timeout: 10 * time.Second}
+		conn, err := dialer.DialContext(ctx, "tcp", target)
+		if err != nil {
+			return nil, apperrors.Wrap(apperrors.TargetForbidden, "peer direct dial failed", err)
+		}
+		return conn, nil
+	}
+	if strings.HasPrefix(via, "ssh:") {
+		nodeID := strings.TrimPrefix(via, "ssh:")
+		client, err := s.SSH.Client(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := client.Dial("tcp", target)
+		if err != nil {
+			return nil, apperrors.Wrap(apperrors.TargetForbidden, "peer ssh relay dial failed", err)
+		}
+		return conn, nil
+	}
+	return nil, apperrors.New(apperrors.InvalidArgument, "unsupported via: "+via)
+}
+
+// RegisterPeer 登记一个主动注册的反向接入节点（HTTP 注册入口）。
+func (s *Service) RegisterPeer(ctx context.Context, registration peer.Registration, remoteAddr string) (model.Node, error) {
+	if err := s.Authorize(ctx, "peer.register", policy.CapBase); err != nil {
+		return model.Node{}, err
+	}
+	return s.Peer.Register(registration, remoteAddr)
+}
+
+// PeerStatus 返回下级 agent 状态、上级链路状态与相关设置。
+func (s *Service) PeerStatus() map[string]any {
+	settings := s.Settings()
+	status := map[string]any{
+		"enabled":       parseBool(settings["peer_enabled"]),
+		"bind_scope":    settings["peer_bind_scope"],
+		"port":          intSetting(settings["peer_port"], peer.DefaultPort),
+		"seeds":         settings["peer_seeds"],
+		"probe_subnets": settings["peer_probe_subnets"],
+		"pool_size":     intSetting(settings["peer_pool_size"], 4),
+		"auto_trust":    parseBool(settings["peer_auto_trust"]),
+		"address":       discovery.PrimaryIP(),
+		"agent":         s.PeerAgent.Status(),
+		"links":         s.Peer.Links(),
+		"local_subnets": discovery.LocalSubnets(),
+	}
+	return status
+}
+
+// RefreshPeer 重启下级发现循环（立即重新发现并选主）。
+func (s *Service) RefreshPeer(ctx context.Context) error {
+	if err := s.Authorize(ctx, "peer.refresh", policy.CapBase); err != nil {
+		return err
+	}
+	if !parseBool(s.Settings()["peer_enabled"]) {
+		return apperrors.New(apperrors.NotSupported, "反向接入未开启")
+	}
+	s.PeerAgent.Stop()
+	s.PeerAgent.Start(context.Background())
+	s.Audit.Record(ctx, "peer.refresh", "", policy.CapBase, "", time.Now(), nil)
+	return nil
+}
+
 func (s *Service) Close() {
+	if s.PeerAgent != nil {
+		s.PeerAgent.Stop()
+	}
+	if s.Peer != nil {
+		s.Peer.Close()
+	}
 	s.Tunnels.Close()
+	if s.PortMappings != nil {
+		s.PortMappings.Close()
+	}
 	_ = s.SSH.CloseAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	_ = s.Plugin.Close(ctx)
@@ -128,6 +328,13 @@ func (s *Service) ApplyRuntimeSettings(ctx context.Context) {
 	if s.Discovery != nil {
 		_ = s.Discovery.SetEnabled(ctx, parseBool(s.Settings()["discovery_enabled"]))
 	}
+	if s.PeerAgent != nil {
+		if parseBool(s.Settings()["peer_enabled"]) {
+			s.PeerAgent.Start(context.Background())
+		} else {
+			s.PeerAgent.Stop()
+		}
+	}
 	if s.OnSettingsChanged != nil {
 		s.OnSettingsChanged()
 	}
@@ -171,9 +378,11 @@ func localNode() model.Node {
 	if userName == "" {
 		userName = "local"
 	}
+	// 地址必须是本机真实 LAN IP：hostname 可能是 "localhost"，对反向接入对端没有意义。
 	return model.Node{
-		ID: model.NodeIDFromMAC(), DisplayID: model.NodeIDFromMAC(), Name: "本地节点", Address: host, Port: 0, Username: userName,
-		AuthMethod: "local", Protocol: "local", Tags: []string{"local"},
+		ID: model.NodeIDFromMAC(), DisplayID: model.NodeIDFromMAC(), Name: "本地节点",
+		Address: discovery.PrimaryIP(), Port: 0, Username: userName,
+		AuthMethod: "local", Protocol: "local", Tags: []string{"local", "host:" + host},
 		Status: "connected", CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Now().UTC(),
 	}
 }
@@ -296,6 +505,11 @@ func (s *Service) Exec(ctx context.Context, nodeID, command string, timeout time
 		return model.ExecResult{}, apperrors.New(apperrors.InvalidArgument, "command is required")
 	}
 	started := time.Now()
+	if s.isPeerNode(nodeID) {
+		result, err := s.Peer.Exec(ctx, nodeID, command, timeout)
+		s.Audit.Record(ctx, "peer.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command}), started, err)
+		return result, err
+	}
 	result, err := s.SSH.Exec(ctx, nodeID, sshx.ExecRequest{Command: command, Timeout: timeout})
 	s.Audit.Record(ctx, "ssh.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command}), started, err)
 	return result, err
@@ -305,8 +519,14 @@ func (s *Service) OpenShell(ctx context.Context, nodeID string, cols, rows int) 
 	if err := s.Authorize(ctx, "ssh.shell", policy.CapSSH); err != nil {
 		return nil, err
 	}
+	started := time.Now()
+	if s.isPeerNode(nodeID) {
+		shell, err := s.Peer.OpenPTY(ctx, nodeID, cols, rows)
+		s.Audit.Record(ctx, "peer.shell", nodeID, policy.CapSSH, "", started, err)
+		return shell, err
+	}
 	shell, err := s.SSH.OpenShell(ctx, nodeID, cols, rows)
-	s.Audit.Record(ctx, "ssh.shell", nodeID, policy.CapSSH, "", time.Now(), err)
+	s.Audit.Record(ctx, "ssh.shell", nodeID, policy.CapSSH, "", started, err)
 	return shell, err
 }
 
@@ -570,6 +790,12 @@ func (s *Service) StartTunnel(ctx context.Context, id string) (model.Tunnel, err
 	if isLocalNodeID(definition.NodeID) {
 		return definition, apperrors.New(apperrors.NotSupported, "local node cannot create SSH tunnels")
 	}
+	if definition.Type == "remote" {
+		if node, err := s.Store.GetNode(definition.NodeID); err == nil && node.Protocol == "peer" {
+			return definition, apperrors.New(apperrors.NotSupported,
+				"peer 节点没有 SSH 服务端，不支持反向隧道；请改用端口映射或 Local/SOCKS 隧道")
+		}
+	}
 	if definition.Type != "socks" {
 		if err := s.validateTarget(definition.TargetHost, definition.TargetPort); err != nil {
 			return definition, err
@@ -596,6 +822,67 @@ func (s *Service) DeleteTunnel(ctx context.Context, id string) error {
 	}
 	err := s.Tunnels.Delete(id)
 	s.Audit.Record(ctx, "tunnel.delete", id, policy.CapTunnel, "", time.Now(), err)
+	return err
+}
+
+// ListPortMappings 列出 NPA 自带的端口映射（与 SSH 隧道独立）。
+func (s *Service) ListPortMappings() ([]model.PortMapping, error) { return s.PortMappings.List() }
+
+func portMappingParameters(definition model.PortMapping) map[string]string {
+	return map[string]string{
+		"target": fmt.Sprintf("%s:%d", definition.TargetHost, definition.TargetPort),
+		"listen": fmt.Sprintf("%s:%d", definition.ListenAddress, definition.ListenPort),
+		"via":    definition.ViaNodeID,
+	}
+}
+
+func (s *Service) SavePortMapping(ctx context.Context, definition model.PortMapping) error {
+	if err := s.Authorize(ctx, "portmap.write", policy.CapTunnel); err != nil {
+		return err
+	}
+	if err := s.validateTarget(definition.TargetHost, definition.TargetPort); err != nil {
+		return err
+	}
+	if err := s.Store.SavePortMapping(definition); err != nil {
+		return err
+	}
+	s.Audit.Record(ctx, "portmap.write", "", policy.CapTunnel, audit.SafeParameters(portMappingParameters(definition)), time.Now(), nil)
+	return nil
+}
+
+func (s *Service) StartPortMapping(ctx context.Context, id string) (model.PortMapping, error) {
+	if err := s.Authorize(ctx, "portmap.open", policy.CapTunnel); err != nil {
+		return model.PortMapping{}, err
+	}
+	definition, err := s.Store.GetPortMapping(id)
+	if err != nil {
+		return definition, err
+	}
+	if err := s.validateTarget(definition.TargetHost, definition.TargetPort); err != nil {
+		return definition, err
+	}
+	started := time.Now()
+	result, err := s.PortMappings.Start(ctx, id)
+	result.RuntimePort, result.ViaRoute = s.PortMappings.RuntimeInfo(id)
+	s.Audit.Record(ctx, "portmap.open", "", policy.CapTunnel, audit.SafeParameters(portMappingParameters(result)), started, err)
+	return result, err
+}
+
+func (s *Service) StopPortMapping(ctx context.Context, id string) error {
+	if err := s.Authorize(ctx, "portmap.close", policy.CapTunnel); err != nil {
+		return err
+	}
+	err := s.PortMappings.Stop(id)
+	s.Audit.Record(ctx, "portmap.close", id, policy.CapTunnel, "", time.Now(), err)
+	return err
+}
+
+func (s *Service) DeletePortMapping(ctx context.Context, id string) error {
+	if err := s.Authorize(ctx, "portmap.delete", policy.CapTunnel); err != nil {
+		return err
+	}
+	err := s.PortMappings.Delete(id)
+	s.Audit.Record(ctx, "portmap.delete", id, policy.CapTunnel, "", time.Now(), err)
 	return err
 }
 

@@ -42,6 +42,15 @@ func TestCapabilityToolsRefresh(t *testing.T) {
 		}
 		return names
 	}
+	// 调试期默认能力全开；此处先显式关闭，验证能力开关确实能收窄 MCP 工具面。
+	if err := app.SaveSettings(map[string]string{
+		"mcp_bind_scope": "loopback",
+		"mcp_ssh":        "false", "mcp_file": "false", "mcp_tunnel": "false",
+		"mcp_screenshot": "false", "mcp_mouse": "false",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager.Refresh()
 	if names := list(); !names["nodes.list"] || names["ssh.exec"] {
 		t.Fatalf("unexpected default tools: %#v", names)
 	}

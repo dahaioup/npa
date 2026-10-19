@@ -21,6 +21,11 @@ const (
 
 type Service struct {
 	SSH *sshx.Manager
+	// IsPeer 判断节点是否为反向接入（peer）节点；
+	// PeerFS 返回该节点上的 SFTP 会话。两者由 service 注入，
+	// 文件页 / MCP file 工具因此无需感知底层是 SSH 还是反向链路。
+	IsPeer func(nodeID string) bool
+	PeerFS func(ctx context.Context, nodeID string) (*sftp.Client, func(), error)
 }
 
 func NewService(sshManager *sshx.Manager) *Service { return &Service{SSH: sshManager} }
@@ -36,6 +41,12 @@ func cleanPath(value string) string {
 }
 
 func (s *Service) client(ctx context.Context, nodeID string) (*sftp.Client, func(), error) {
+	if s.IsPeer != nil && s.IsPeer(nodeID) {
+		if s.PeerFS == nil {
+			return nil, func() {}, apperrors.New(apperrors.NotSupported, "反向链路文件能力未启用")
+		}
+		return s.PeerFS(ctx, nodeID)
+	}
 	sshClient, err := s.SSH.Client(ctx, nodeID)
 	if err != nil {
 		return nil, func() {}, err

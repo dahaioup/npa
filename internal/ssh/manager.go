@@ -103,6 +103,14 @@ func (m *Manager) authMethods(node model.Node, credential model.Credential) ([]s
 		}
 		client := agent.NewClient(conn)
 		return []ssh.AuthMethod{ssh.PublicKeysCallback(client.Signers)}, nil
+	case "peer", "discovered", "local":
+		// 这些是 NPA 自己的节点，不是 SSH 服务端；给可操作的提示而不是笼统的"不支持的认证方式"。
+		hint := map[string]string{
+			"peer":       "该节点通过反向接入连入，没有 SSH 服务端；请改用端口映射 / Local / SOCKS 隧道（NPA 自带数据面），或给它补一组 SSH 凭据",
+			"discovered": "该节点是 mDNS 发现的 NPA 节点，尚未录入 SSH 凭据；请先在节点页补上用户名与密钥，或让它通过反向接入注册",
+			"local":      "本地节点直接在本机执行，不需要 SSH",
+		}
+		return nil, apperrors.New(apperrors.Authentication, hint[node.AuthMethod])
 	default:
 		return nil, apperrors.New(apperrors.InvalidArgument, "unsupported authentication method")
 	}

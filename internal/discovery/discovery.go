@@ -44,6 +44,58 @@ func NewManager(repo Repository, version string) *Manager {
 	return &Manager{repo: repo, version: version, status: "disabled"}
 }
 
+// LocalIPs 返回本机私网单播地址（IPv4 优先，排序稳定），用于节点自报可达地址。
+func LocalIPs() []string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return []string{}
+	}
+	v4 := map[string]struct{}{}
+	v6 := map[string]struct{}{}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			prefix, err := netip.ParsePrefix(addr.String())
+			if err != nil {
+				continue
+			}
+			ip := prefix.Addr().Unmap()
+			if !ip.IsPrivate() || ip.IsLoopback() {
+				continue
+			}
+			if ip.Is4() {
+				v4[ip.String()] = struct{}{}
+			} else {
+				v6[ip.String()] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(v4)+len(v6))
+	for ip := range v4 {
+		result = append(result, ip)
+	}
+	for ip := range v6 {
+		result = append(result, ip)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// PrimaryIP 返回本机首选私网地址，取不到时退回回环地址。
+func PrimaryIP() string {
+	addresses := LocalIPs()
+	if len(addresses) == 0 {
+		return "127.0.0.1"
+	}
+	return addresses[0]
+}
+
 func LocalSubnets() []string {
 	interfaces, err := net.Interfaces()
 	if err != nil {

@@ -24,7 +24,7 @@
 4. **无用户配置文件**：业务配置通过 Web 修改，内部数据库持久化。
 5. **Capability 权限**：MCP 权限按能力独立控制。
 6. **阶段解耦**：Phase 1 不依赖 Desktop 或 Discovery。
-7. **数据面复用**：Phase 3 Relay 复用 Tunnel/SSH，不创建新的私有数据面协议。
+7. **数据面复用**：Phase 3 Relay 复用 Tunnel/SSH；反向接入（FR-16B）新增的通道**只承载帧路由**，数据本身仍由 SSH `direct-tcpip` 段与标准 SFTP 协议承担，**不自造文件/隧道协议栈**（修订见 ADR-12 / ADR-23）。
 8. **安全默认值**：Web/MCP 回环监听，高权限 Capability 默认关闭。
 
 ---
@@ -166,24 +166,26 @@ plugins/
 | `56700/tcp` | `127.0.0.1` | Web UI + REST API + Web Proxy |
 | `56701/tcp` | `127.0.0.1`（默认）或局域网范围 | MCP Streamable HTTP；范围由 Web 设置控制 |
 | `5353/udp` | mDNS 标准组播 | Phase 3 Discovery；非 NPA 私有端口 |
+| `56710/tcp` | `0.0.0.0`（默认，可切回 `127.0.0.1`） | 反向接入：注册 / 长连接 / 空闲数据连接（FR-16B）；**Web 管理面仍固定 127.0.0.1** |
 
 NPA **不预留发现端口范围**。
 
 ### 3.2 动态端口
 
-SSH Local Forward / SOCKS 等本地监听端口：
+SSH Local Forward / SOCKS 以及 Phase 3 端口映射的本地监听端口：
 
 - 由用户指定；或
 - 由系统通过 `:0`/空闲端口选择动态分配。
 
-不再固定 `18000-18999` 等端口池。
+不再固定 `18000-18999` 等端口池。端口映射默认绑定 `127.0.0.1`，仅在该条映射显式开启时才绑定 `0.0.0.0`。
 
 ### 3.3 网络边界
 
 - Web 和 MCP 默认只绑定 loopback。
 - SSH/SFTP/Tunnel 为主动出站连接。
 - Phase 3 mDNS 仅在 Discovery 开启时加入组播并发布服务。
-- 访问公网地址的代理/Relay 默认禁止或需要显式授权。
+- 访问公网地址的代理/Relay/端口映射默认禁止或需要显式授权。
+- 端口映射本机入口默认仅 loopback；非回环绑定必须逐条映射显式开启并标识暴露面。
 - MCP HTTP 必须实施 Host/Origin/认证等本地 HTTP 安全措施。
 
 ---
@@ -213,6 +215,8 @@ cmd/npa
       |
       +-- discovery     # Phase 3
       +-- relay         # Phase 3
+      +-- peer          # Phase 3 反向接入（Hub=上级 / Agent=下级）
+      +-- portmap       # Phase 3 端口映射（独立于 tunnel）
 ```
 
 v1~v3 不设计 Control/Gateway 多进程拆分。未来如出现强需求再通过 ADR 重新评估。
@@ -232,6 +236,8 @@ Application Service
   DesktopService
   DiscoveryService
   RelayService
+  PeerService
+  PortMappingService
         |
         v
 Policy + Audit
@@ -241,6 +247,10 @@ Infrastructure
   SSH Client
   SFTP/FTP Adapter
   Tunnel Engine
+  Relay Dialer
+  Port Mapping Listener
+  WebSocket 通道（gorilla）
+  SFTP over 通道（pkg/sftp client/server）
   State DB
   OS Desktop Adapter
   mDNS Adapter
@@ -507,9 +517,11 @@ Overview
 Nodes
   ├─ mDNS Topology
   ├─ Node Detail (click to inspect)
-  └─ Reachable Subnets / Relay Routes
+  ├─ Reachable Subnets / Relay Routes
+  └─ 反向接入（种子 / 探测网段 / 已注册子网节点）
 SSH
 Tunnels
+Port Mappings            # Phase 3，独立于 Tunnels
 Audit
 Settings
   ├─ MCP Service Scope
@@ -1019,8 +1031,72 @@ RelayDialer
 
 SSH/File/Web/Tunnel 不需要理解路由细节。
 
+### 11.4 端口映射（Port Mapping）
+
+面向"本机无法直连子网设备、但子网内 NPA 节点可以"的场景（如用 RustDesk 远程子网机器），把子网目标 IP:端口映射到本机端口。
+
+```text
+本机客户端（RustDesk 等）
+      |
+      |  TCP  127.0.0.1:<本机端口>   （portmap 监听）
+      v
++-- internal/portmap --------------------------------+
+|  accept -> Dialer.Select/DialRoute -> pipe          |
++-----------------------------------------------------+
+      |                         |
+      | 目标在本机子网内          | 目标在远端子网
+      v                         v
+  DirectDialer            RelayDialer (SSH direct-tcpip)
+                               |
+                               v
+                        子网节点 -> 目标 IP:端口
+```
+
+要点：
+
+1. **与 Tunnel 解耦**：`internal/portmap` 不读取、不写入 `tunnel_definitions`，也不复用 Tunnel 运行时；数据面直接依赖 `relay.Manager` 的 `DialRoute` / `DialNode`。
+2. **选路复用 Relay**：直连优先，否则由 Relay 依据已授权节点的 `reachable_subnets` 选择；用户可在单条映射上显式固定经由节点。
+3. **监听策略**：默认 `127.0.0.1`；`0.0.0.0` / `::` 必须由用户在该条映射上显式选择，列表中以醒目标识提示。
+4. **状态与恢复**：定义写入 `port_mappings` 桶，运行态（实际端口、经由路径、状态）仅在内存维护，`restore_port_mappings` 开启时启动恢复。
+5. **审计与权限**：创建 / 启动 / 停止 / 删除走 `Policy + Audit`（`CapTunnel`），日志含目标与监听信息；当前不暴露 MCP 工具。
+
 ---
 
+
+### 11.5 反向接入架构（子网节点 → 上级注册）
+
+mDNS 只在本广播域有效，上级无法主动发现子网节点，因此方向反转：由下级发现上级、注册并保持长连接。
+
+```text
+下级 NPA（192.168.2.192）                     上级 NPA（192.168.0.165）
+  peer.Agent ──出站──► 56710 /api/peers/register ──► peer.Hub → Node{protocol:"peer"}
+  ├─ 控制长连接 /link（register/心跳 15s，读超时 45s，指数退避重连）
+  └─ 空闲数据连接 /conn ×4（frp 式 workConn 池）
+
+      上级本地监听 127.0.0.1:<端口> accept
+            │  hub.take() 取一条空闲连接
+            ▼  首帧（JSON 文本帧）{type, target, via}
+      下级按 type 分发：
+        open → via=direct 直连 / via=ssh:<node> 经本机 SSH 客户端
+        exec → 本机执行，回 stdout/stderr/exit（JSON 帧）
+        pty  → 本机 shell，双工字节流
+        fs   → 标准 SFTP 字节流（pkg/sftp server）
+            │  应答帧（二进制首字节 0=ok / 1=err + 文本）
+            ▼
+      open/pty/fs 的后续帧纯字节双向透传 → 复用 pipe() 语义
+```
+
+**要点**
+
+1. **方向不可逆**：`/link`、`/conn` 全部由下级发起，上级从不向子网发起连接，因此不要求子网开放任何入站端口。
+2. **四类通道共用一套取用流程**（取连接 → 写首帧 → 读应答 → 按类型处理），协议面最小；帧定义见 `internal/peer/protocol.go`。
+3. **`fs` 走标准 SFTP**：上侧 `sftp.NewClientPipe`，下侧 `sftp.NewServer`（服务真实文件系统），协议复用 `pkg/sftp`，两侧都不启动 SSH 服务端。
+4. **链式「NPA 映射 + SSH 映射」**：下级注册时上报 `ssh_routes`（其纳管且授权的 SSH 跳板及其宣告子网），上级 `relay.Select` 据此产出 `[peer, sshNode]` 两跳，拨号时用 `via=ssh:<node>` 让对端再走 `direct-tcpip`。
+5. **与现有模块的接缝**：`relay.SetPeerDialer(hub)` 注入数据面 → `portmap`、`tunnel`（local/socks）、Web 代理与 `service.Exec/OpenShell/FileX` 一律经同一路由，上层不需要感知"正向还是反向"。
+6. **选路优先级**：本机直连 → peer 宣告子网 → 本机 SSH 节点 → peer 对端跳板串联 → 私网兜底试拨。
+7. **可观测**：`/api/peers` 返回 agent 状态（当前上级、候选、连接池、错误）与全部在线链路；节点详情标注"反向接入"。
+
+---
 
 ## 12. Phase 4 Third-party Plugin Ecosystem
 
@@ -1287,7 +1363,9 @@ npa/
 │   ├── credentials/
 │   ├── desktop/          # Phase 2
 │   ├── discovery/        # Phase 3
-│   └── relay/            # Phase 3
+│   ├── relay/            # Phase 3
+│   ├── portmap/          # Phase 3 端口映射（独立于 tunnel）
+│   └── peer/             # Phase 3 反向接入（protocol/hub/agent/discover/channels）
 ├── plugins/                 # 运行时插件目录（不属于 Core 源码依赖）
 │   ├── windows/
 │   ├── macos/
@@ -1580,7 +1658,7 @@ Go/native reference plugin
 | ADR-09 | Tunnel 数据面复用 SSH，可靠性设计参考 Chisel |
 | ADR-10 | MCP 权限使用 Capability 模型 |
 | ADR-11 | Screenshot 与 Mouse 权限分离 |
-| ADR-12 | Phase 3 Relay 复用现有 Dialer/Tunnel，不创建私有数据面协议 |
+| ADR-12 | Phase 3 Relay 复用现有 Dialer/Tunnel；**反向接入**仅新增"首帧路由 + 通道"这一层帧封装，数据面仍复用 SSH `direct-tcpip` 与标准 SFTP（修订于 FR-16B） |
 | ADR-13 | Phase 3 初版 Relay 最多一跳，多跳延后 |
 | ADR-14 | NPA Core 保持 `CGO_ENABLED=0`；原生/CGO 能力通过独立插件隔离 |
 | ADR-15 | Plugin Protocol 使用 JSON-RPC 2.0 + stdio + Content-Length framing |
@@ -1588,6 +1666,10 @@ Go/native reference plugin
 | ADR-17 | 插件目录采用 Universal 根目录 + OS 专用目录，平台实现优先于通用实现 |
 | ADR-18 | 大型二进制数据通过受控资源引用传递，不默认 Base64 塞入 JSON-RPC |
 | ADR-19 | Phase 2 只开放官方插件；Phase 4 开放语言无关第三方插件生态 |
+| ADR-20 | 端口映射（FR-16A）独立于 Tunnel 定义，数据面复用 Relay 选路，仅由 Web 管理、暂不提供 MCP 工具 |
+| ADR-21 | 端口映射本机入口默认 loopback，非回环监听必须逐条映射显式开启 |
+| ADR-22 | 反向接入使用独立端口 `56710` 且默认监听局域网，Web 管理面 `56700` 保持回环；注册暂不鉴权（调试期），收紧时在注册入口加 token，协议不变 |
+| ADR-23 | peer 节点不实现 SSH 服务端：命令/终端走 NPA 自有通道，文件用 `pkg/sftp` client/server 跑在同一通道上 |
 
 ---
 

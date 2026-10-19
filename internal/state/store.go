@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,15 +23,16 @@ import (
 )
 
 var (
-	settingsBucket    = []byte("settings")
-	nodesBucket       = []byte("nodes")
-	credentialsBucket = []byte("credentials")
-	tunnelsBucket     = []byte("tunnels")
-	auditBucket       = []byte("audit")
-	discoveredBucket  = []byte("discovered_nodes")
-	relayBucket       = []byte("relay_routes")
-	metaBucket        = []byte("meta")
-	auditSeqKey       = []byte("audit_sequence")
+	settingsBucket     = []byte("settings")
+	nodesBucket        = []byte("nodes")
+	credentialsBucket  = []byte("credentials")
+	tunnelsBucket      = []byte("tunnels")
+	auditBucket        = []byte("audit")
+	discoveredBucket   = []byte("discovered_nodes")
+	relayBucket        = []byte("relay_routes")
+	portMappingsBucket = []byte("port_mappings")
+	metaBucket         = []byte("meta")
+	auditSeqKey        = []byte("audit_sequence")
 )
 
 type Store struct {
@@ -93,7 +95,7 @@ func loadOrCreateKey(path string) ([]byte, error) {
 
 func (s *Store) initialize() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{settingsBucket, nodesBucket, credentialsBucket, tunnelsBucket, auditBucket, discoveredBucket, relayBucket, metaBucket} {
+		for _, name := range [][]byte{settingsBucket, nodesBucket, credentialsBucket, tunnelsBucket, auditBucket, discoveredBucket, relayBucket, portMappingsBucket, metaBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -119,20 +121,29 @@ func readJSON(bucket *bolt.Bucket, key []byte, target any) bool {
 
 func defaults() map[string]string {
 	return map[string]string{
-		"mcp_enabled":          "true",
-		"mcp_ssh":              "false",
-		"mcp_file":             "false",
-		"mcp_tunnel":           "false",
-		"mcp_screenshot":       "false",
-		"mcp_mouse":            "false",
-		"mcp_discovery":        "false",
-		"mcp_relay":            "false",
-		"mcp_bind_scope":       "loopback",
-		"discovery_enabled":    "false",
-		"allow_public_targets": "false",
-		"log_level":            "info",
-		"audit_retention_days": "30",
-		"restore_tunnels":      "true",
+		// 调试期默认：能力全开、MCP 与 Discovery 局域网可达（Web 管理面仍固定回环）。
+		"mcp_enabled":           "true",
+		"mcp_ssh":               "true",
+		"mcp_file":              "true",
+		"mcp_tunnel":            "true",
+		"mcp_screenshot":        "true",
+		"mcp_mouse":             "true",
+		"mcp_discovery":         "true",
+		"mcp_relay":             "true",
+		"mcp_bind_scope":        "lan",
+		"discovery_enabled":     "true",
+		"allow_public_targets":  "false",
+		"log_level":             "info",
+		"audit_retention_days":  "30",
+		"restore_tunnels":       "true",
+		"restore_port_mappings": "true",
+		"peer_enabled":          "true",
+		"peer_bind_scope":       "lan",
+		"peer_port":             "56710",
+		"peer_seeds":            "",
+		"peer_probe_subnets":    "",
+		"peer_pool_size":        "4",
+		"peer_auto_trust":       "true",
 	}
 }
 
@@ -196,11 +207,20 @@ func (s *Store) SaveNode(node model.Node) error {
 	if node.ID == "" || node.Name == "" || node.Address == "" || node.Username == "" {
 		return apperrors.New(apperrors.InvalidArgument, "id, name, address and username are required")
 	}
-	if node.Port <= 0 || node.Port > 65535 {
+	if node.Port < 0 || node.Port > 65535 {
 		return apperrors.New(apperrors.InvalidArgument, "invalid SSH port")
 	}
-	if node.AuthMethod != "key" && node.AuthMethod != "password" && node.AuthMethod != "agent" {
-		return apperrors.New(apperrors.InvalidArgument, "auth_method must be key, password or agent")
+	// 反向接入的 peer 节点不需要 SSH 端口（连接由它主动建立），地址也只是自报值。
+	if node.Protocol != "peer" && node.Port <= 0 {
+		return apperrors.New(apperrors.InvalidArgument, "invalid SSH port")
+	}
+	if node.Port > 65535 {
+		return apperrors.New(apperrors.InvalidArgument, "invalid SSH port")
+	}
+	switch node.AuthMethod {
+	case "key", "password", "agent", "peer":
+	default:
+		return apperrors.New(apperrors.InvalidArgument, "auth_method must be key, password, agent or peer")
 	}
 	if node.Protocol == "" {
 		node.Protocol = "sftp"
@@ -468,6 +488,84 @@ func (s *Store) DeleteRelayRoute(targetSubnet, viaNodeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(relayBucket).Delete([]byte(targetSubnet + "|" + viaNodeID)) })
+}
+
+func (s *Store) ListPortMappings() ([]model.PortMapping, error) {
+	mappings := []model.PortMapping{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(portMappingsBucket).ForEach(func(_, value []byte) error {
+			var mapping model.PortMapping
+			if err := json.Unmarshal(value, &mapping); err != nil {
+				return err
+			}
+			mappings = append(mappings, mapping)
+			return nil
+		})
+	})
+	sort.Slice(mappings, func(i, j int) bool { return mappings[i].Name < mappings[j].Name })
+	return mappings, err
+}
+
+func (s *Store) GetPortMapping(id string) (model.PortMapping, error) {
+	var mapping model.PortMapping
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if !readJSON(tx.Bucket(portMappingsBucket), []byte(id), &mapping) {
+			return apperrors.New(apperrors.InvalidArgument, "port mapping not found")
+		}
+		return nil
+	})
+	return mapping, err
+}
+
+func (s *Store) SavePortMapping(mapping model.PortMapping) error {
+	if mapping.ID == "" || mapping.Name == "" {
+		return apperrors.New(apperrors.InvalidArgument, "id and name are required")
+	}
+	if strings.TrimSpace(mapping.TargetHost) == "" {
+		return apperrors.New(apperrors.InvalidArgument, "目标主机不能为空")
+	}
+	if mapping.TargetPort <= 0 || mapping.TargetPort > 65535 {
+		return apperrors.New(apperrors.InvalidArgument, "目标端口必须在 1-65535 之间")
+	}
+	if mapping.ListenPort < 0 || mapping.ListenPort > 65535 {
+		return apperrors.New(apperrors.InvalidArgument, "本机监听端口必须在 0-65535 之间")
+	}
+	if mapping.ListenAddress == "" {
+		mapping.ListenAddress = "127.0.0.1"
+	}
+	if mapping.ListenAddress != "127.0.0.1" && mapping.ListenAddress != "::1" && mapping.ListenAddress != "0.0.0.0" && mapping.ListenAddress != "::" {
+		return apperrors.New(apperrors.InvalidArgument, "监听地址仅支持 127.0.0.1、::1、0.0.0.0 或 ::")
+	}
+	if mapping.Status == "" {
+		mapping.Status = "stopped"
+	}
+	now := time.Now().UTC()
+	if mapping.CreatedAt.IsZero() {
+		mapping.CreatedAt = now
+	}
+	mapping.UpdatedAt = now
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error { return writeJSON(tx.Bucket(portMappingsBucket), []byte(mapping.ID), mapping) })
+}
+
+func (s *Store) UpdatePortMappingStatus(id, status, lastError string) error {
+	mapping, err := s.GetPortMapping(id)
+	if err != nil {
+		return err
+	}
+	mapping.Status = status
+	mapping.LastError = lastError
+	mapping.UpdatedAt = time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error { return writeJSON(tx.Bucket(portMappingsBucket), []byte(id), mapping) })
+}
+
+func (s *Store) DeletePortMapping(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(portMappingsBucket).Delete([]byte(id)) })
 }
 
 func (s *Store) AddAudit(event model.AuditEvent) (model.AuditEvent, error) {

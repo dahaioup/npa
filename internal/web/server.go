@@ -19,6 +19,7 @@ import (
 
 	apperrors "github.com/npa/npa/internal/errors"
 	"github.com/npa/npa/internal/model"
+	"github.com/npa/npa/internal/peer"
 	"github.com/npa/npa/internal/policy"
 	"github.com/npa/npa/internal/service"
 )
@@ -109,6 +110,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/{id}/start", s.handleTunnelStart)
 	mux.HandleFunc("POST /api/tunnels/{id}/stop", s.handleTunnelStop)
 	mux.HandleFunc("DELETE /api/tunnels/{id}", s.handleTunnelDelete)
+	mux.HandleFunc("GET /api/portmappings", s.handlePortMappings)
+	mux.HandleFunc("POST /api/portmappings", s.handlePortMappingSave)
+	mux.HandleFunc("POST /api/portmappings/{id}/start", s.handlePortMappingStart)
+	mux.HandleFunc("POST /api/portmappings/{id}/stop", s.handlePortMappingStop)
+	mux.HandleFunc("DELETE /api/portmappings/{id}", s.handlePortMappingDelete)
 	mux.HandleFunc("POST /api/webproxy/open", s.handleOpenWeb)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
 	mux.HandleFunc("PUT /api/settings", s.handleSettingsSave)
@@ -118,12 +124,103 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/network/subnets", s.handleNetworkSubnets)
 	mux.HandleFunc("GET /api/relay/routes", s.handleRelayRoutes)
 	mux.HandleFunc("POST /api/relay/open", s.handleRelayOpen)
+	s.peerRoutes(mux)
 	mux.HandleFunc("GET /api/audit", s.handleAudit)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /proxy/{id}/", s.handleProxy)
 	mux.HandleFunc("GET /api/nodes/{id}/pty", s.handlePTY)
 	mux.HandleFunc("/", s.handleStatic)
 	return securityHeaders(mux)
+}
+
+// peerRoutes 注册反向接入相关路由；同时挂到回环 Web 与独立的 peer 端口上。
+func (s *Server) peerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/info", s.app.Peer.HandleInfo)
+	mux.HandleFunc("POST /api/peers/register", s.handlePeerRegister)
+	mux.HandleFunc("GET /api/peers/link", s.app.Peer.HandleLink)
+	mux.HandleFunc("GET /api/peers/conn", s.app.Peer.HandleConn)
+	mux.HandleFunc("GET /api/peers", s.handlePeerStatus)
+	mux.HandleFunc("PUT /api/peers", s.handlePeerSettings)
+	mux.HandleFunc("POST /api/peers/discover", s.handlePeerDiscover)
+}
+
+// PeerHandler 是 peer 端口专用的处理器：只暴露反向接入入口，不含 Web 管理面。
+func (s *Server) PeerHandler() http.Handler {
+	mux := http.NewServeMux()
+	s.peerRoutes(mux)
+	return securityHeaders(mux)
+}
+
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
+	var registration peer.Registration
+	if err := decodeJSON(r, &registration); err != nil {
+		writeError(w, err)
+		return
+	}
+	node, err := s.app.RegisterPeer(policy.WithSource(r.Context(), policy.SourceWeb), registration, remoteHost(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"registered": true, "id": node.ID})
+}
+
+func (s *Server) handlePeerStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, 200, s.app.PeerStatus())
+}
+
+func (s *Server) handlePeerSettings(w http.ResponseWriter, r *http.Request) {
+	var values map[string]string
+	if err := decodeJSON(r, &values); err != nil {
+		writeError(w, err)
+		return
+	}
+	for key, value := range values {
+		if !strings.HasPrefix(key, "peer_") {
+			writeError(w, apperrors.New(apperrors.InvalidArgument, "仅允许修改 peer_* 设置: "+key))
+			return
+		}
+		switch key {
+		case "peer_probe_subnets":
+			if _, err := peer.ParseProbeSubnets(value); err != nil {
+				writeError(w, apperrors.Wrap(apperrors.InvalidArgument, "invalid probe subnets", err))
+				return
+			}
+		case "peer_port":
+			port, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || port < 1 || port > 65535 {
+				writeError(w, apperrors.New(apperrors.InvalidArgument, "peer_port 必须在 1-65535 之间"))
+				return
+			}
+		case "peer_pool_size":
+			size, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || size < 1 || size > 32 {
+				writeError(w, apperrors.New(apperrors.InvalidArgument, "peer_pool_size 必须在 1-32 之间"))
+				return
+			}
+		}
+	}
+	if err := s.app.SaveSettings(values); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, s.app.PeerStatus())
+}
+
+func (s *Server) handlePeerDiscover(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.RefreshPeer(policy.WithSource(r.Context(), policy.SourceWeb)); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"refreshed": true})
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -425,6 +522,57 @@ func (s *Server) handleOpenWeb(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"path": path, "url": "http://127.0.0.1:56700" + path})
 }
 
+func (s *Server) handlePortMappings(w http.ResponseWriter, _ *http.Request) {
+	mappings, err := s.app.ListPortMappings()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, mappings)
+}
+
+func (s *Server) handlePortMappingSave(w http.ResponseWriter, r *http.Request) {
+	var definition model.PortMapping
+	if err := decodeJSON(r, &definition); err != nil {
+		writeError(w, err)
+		return
+	}
+	if definition.ID == "" {
+		definition.ID = fmt.Sprintf("map-%d", time.Now().UnixNano())
+	}
+	if err := s.app.SavePortMapping(policy.WithSource(r.Context(), policy.SourceWeb), definition); err != nil {
+		writeError(w, err)
+		return
+	}
+	saved, _ := s.app.Store.GetPortMapping(definition.ID)
+	writeJSON(w, 200, saved)
+}
+
+func (s *Server) handlePortMappingStart(w http.ResponseWriter, r *http.Request) {
+	definition, err := s.app.StartPortMapping(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, definition)
+}
+
+func (s *Server) handlePortMappingStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.StopPortMapping(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"stopped": true})
+}
+
+func (s *Server) handlePortMappingDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeletePortMapping(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"deleted": true})
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, s.app.Settings())
 }
@@ -602,7 +750,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	target := fmt.Sprintf("%s:%d", definition.TargetHost, definition.TargetPort)
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return s.app.Tunnels.Dial(ctx, definition.NodeID, target)
+			return s.app.DialNode(ctx, definition.NodeID, target)
 		},
 		ForceAttemptHTTP2: false,
 	}
