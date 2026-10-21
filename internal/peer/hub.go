@@ -154,6 +154,7 @@ func (h *Hub) Register(registration Registration, fallbackAddress string) (model
 		Capabilities: registration.Caps, ReachableSubnets: registration.Subnets,
 		Trusted: autoTrust, RelayEnabled: true, Registered: true,
 		PeerRoutes: registration.SSHRoutes,
+		Version:    registration.Version,
 		PeerSource: registration.Source, LastSeen: now, UpdatedAt: now,
 	}
 	if previous, err := h.repo.GetNode(registration.ID); err == nil {

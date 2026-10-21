@@ -1,6 +1,7 @@
 package peer_test
 
 import (
+	"archive/zip"
 	"bufio"
 	"context"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -501,5 +504,123 @@ func TestReverseChannelSurvivesBeyondHandshakeTimeout(t *testing.T) {
 	}
 	if strings.TrimSpace(line) != "echo:late" {
 		t.Fatalf("unexpected response after handshake window: %q", line)
+	}
+}
+
+// 更新全流程（走反向链路）：下级节点自报更高版本并"放着"一个更新包，
+// 上级应能发现候选、下载、解出本平台二进制并完成校验。
+// 不执行替换那一步 —— 那会覆盖正在跑的测试二进制。
+func TestUpdatePipelineOverReverseLink(t *testing.T) {
+	storeUpper, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeUpper.Close()
+	upper := service.New(storeUpper)
+	defer upper.Close()
+	upperServer := httptest.NewServer(web.New(upper, fakeMCP{}).PeerHandler())
+	defer upperServer.Close()
+
+	// 下级侧准备"新版"产物：全平台 zip，内含本平台二进制（魔数 + 足够体积）
+	artifactDir := t.TempDir()
+	archivePath := filepath.Join(artifactDir, "npa-all_20990101_0000.zip")
+	if err := writeFakePackage(archivePath); err != nil {
+		t.Fatal(err)
+	}
+
+	seed := strings.TrimPrefix(upperServer.URL, "http://")
+	lower := peer.NewAgent(peer.AgentOptions{
+		Version:  "9.9.9", // 明显高于本机
+		NodeID:   func() string { return "LOWER-SUBNET-NODE" },
+		Name:     func() string { return "新版节点" },
+		Address:  func() string { return "192.168.2.192" },
+		Subnets:  func() []string { return []string{"192.168.2.0/24"} },
+		PoolSize: func() int { return 2 },
+		Seeds:    func() string { return seed },
+		Dial: func(ctx context.Context, target, via string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "tcp", startEcho(t))
+		},
+	})
+	lower.Start(context.Background())
+	defer lower.Stop()
+	waitFor(t, 10*time.Second, func() bool { return len(upper.Peer.Links()) > 0 },
+		"下级没有在超时内向上级注册")
+
+	if err := upper.SaveSettings(map[string]string{"update_artifact": artifactDir}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	check, err := upper.UpdateCheck(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list, ok := check["updates"].([]interface{}); ok {
+		if len(list) != 1 {
+			t.Fatalf("应发现 1 个更新候选: %#v", check)
+		}
+		entry := list[0].(map[string]interface{})
+		if entry["node_version"] != "9.9.9" {
+			t.Fatalf("候选版本不对: %#v", entry)
+		}
+		if !strings.Contains(entry["artifact"].(string), "npa-all_20990101_0000.zip") {
+			t.Fatalf("候选产物不对: %#v", entry)
+		}
+	}
+	prepared, err := upper.UpdatePrepare(ctx, "LOWER-SUBNET-NODE", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared["node_version"] != "9.9.9" {
+		t.Fatalf("下载结果版本不对: %#v", prepared)
+	}
+	if digest, _ := prepared["sha256"].(string); digest == "" {
+		t.Fatalf("缺少 sha256: %#v", prepared)
+	}
+	binaryPath, _ := prepared["binary_path"].(string)
+	if binaryPath == "" {
+		t.Fatalf("缺少解出的二进制路径: %#v", prepared)
+	}
+	if _, err := os.Stat(binaryPath); err != nil {
+		t.Fatalf("解出的二进制不存在: %v", err)
+	}
+}
+
+// writeFakePackage 生成一个和发布包同结构的 zip，内含本平台二进制。
+func writeFakePackage(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	writer := zip.NewWriter(file)
+	name := "npa/bin/npa-" + runtime.GOOS + "-" + runtime.GOARCH
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	entry, err := writer.Create(name)
+	if err != nil {
+		return err
+	}
+	payload := make([]byte, 2<<20)
+	copy(payload, fakeMagic())
+	if _, err := entry.Write(payload); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+func fakeMagic() []byte {
+	switch runtime.GOOS {
+	case "windows":
+		return []byte{'M', 'Z', 0x90, 0x00}
+	case "linux":
+		return []byte{0x7f, 'E', 'L', 'F'}
+	default:
+		return []byte{0xcf, 0xfa, 0xed, 0xfe}
 	}
 }

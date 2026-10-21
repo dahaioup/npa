@@ -8,12 +8,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/npa/npa/internal/audit"
+	"github.com/npa/npa/internal/autostart"
 	"github.com/npa/npa/internal/desktop"
 	"github.com/npa/npa/internal/discovery"
 	apperrors "github.com/npa/npa/internal/errors"
@@ -24,14 +26,16 @@ import (
 	"github.com/npa/npa/internal/policy"
 	"github.com/npa/npa/internal/portmap"
 	"github.com/npa/npa/internal/relay"
+	"github.com/npa/npa/internal/selfupdate"
 	sshx "github.com/npa/npa/internal/ssh"
 	"github.com/npa/npa/internal/state"
 	"github.com/npa/npa/internal/tunnel"
+	"github.com/npa/npa/internal/version"
 
 	"github.com/pkg/sftp"
 )
 
-const Version = "0.3.1-phase3"
+const Version = "0.4.0-phase3"
 
 type Service struct {
 	Store             *state.Store
@@ -317,11 +321,74 @@ func (s *Service) SaveSettings(values map[string]string) error {
 			values["mcp_relay"] = "false"
 		}
 	}
+	// 开机自启动：先真正写/删系统的启动项，成功才落库，失败原样报错（不静默）
+	if raw, ok := values["autostart"]; ok {
+		var err error
+		if parseBool(raw) {
+			err = autostart.Enable(s.Store.DataDir())
+		} else {
+			err = autostart.Disable()
+		}
+		if err != nil {
+			return apperrors.Wrap(apperrors.Internal, "设置开机自启动失败", err)
+		}
+	}
+	// 隐藏控制台：run.sh / run.bat 读这个标记决定前台阻塞还是后台异步启动
+	if raw, ok := values["hide_console"]; ok {
+		if parseBool(raw) {
+			if err := os.WriteFile(s.HideConsoleMarker(), []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+				return apperrors.Wrap(apperrors.Internal, "写入隐藏控制台标记失败", err)
+			}
+		} else if err := os.Remove(s.HideConsoleMarker()); err != nil && !os.IsNotExist(err) {
+			return apperrors.Wrap(apperrors.Internal, "删除隐藏控制台标记失败", err)
+		}
+	}
 	if err := s.Store.SaveSettings(values); err != nil {
 		return err
 	}
 	s.ApplyRuntimeSettings(context.Background())
 	return nil
+}
+
+// HideConsoleMarker 是 run.sh / run.bat 读取的标记文件：
+// 存在 → 后台异步启动、输出只进日志；不存在 → 前台阻塞、控制台与日志双输出。
+func (s *Service) HideConsoleMarker() string { return filepath.Join(s.Store.DataDir(), "hide_console") }
+
+// LogFilePath 是日志文件位置，前台与后台模式都会写。
+func (s *Service) LogFilePath() string { return filepath.Join(s.Store.DataDir(), "npa.log") }
+
+// SystemInfo 返回本机版本、平台、路径与自启动等系统状态，供设置页展示。
+func (s *Service) SystemInfo() map[string]any {
+	settings := s.Settings()
+	status, err := autostart.Current()
+	info := map[string]any{
+		"version":                Version,
+		"goos":                   runtime.GOOS,
+		"goarch":                 runtime.GOARCH,
+		"executable":             executablePath(),
+		"data_dir":               s.Store.DataDir(),
+		"log_file":               s.LogFilePath(),
+		"hide_console":           parseBool(settings["hide_console"]),
+		"hide_console_supported": true, // 由 run 脚本后台化实现，跨平台可用
+		"hide_console_marker":    s.HideConsoleMarker(),
+		"update_artifact":        settings["update_artifact"],
+		"autostart":              status,
+	}
+	if err != nil {
+		info["autostart_error"] = err.Error()
+	}
+	return info
+}
+
+func executablePath() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+		return resolved
+	}
+	return path
 }
 
 func (s *Service) ApplyRuntimeSettings(ctx context.Context) {
@@ -381,7 +448,7 @@ func localNode() model.Node {
 	// 地址必须是本机真实 LAN IP：hostname 可能是 "localhost"，对反向接入对端没有意义。
 	return model.Node{
 		ID: model.NodeIDFromMAC(), DisplayID: model.NodeIDFromMAC(), Name: "本地节点",
-		Address: discovery.PrimaryIP(), Port: 0, Username: userName,
+		Address: discovery.PrimaryIP(), Port: 0, Username: userName, Version: Version,
 		AuthMethod: "local", Protocol: "local", Tags: []string{"local", "host:" + host},
 		Status: "connected", CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Now().UTC(),
 	}
@@ -431,6 +498,13 @@ func (s *Service) ListNodes() ([]model.Node, error) {
 		}
 		result = append(result, candidate)
 		known[candidate.ID] = struct{}{}
+	}
+	// 对端自报版本比本机新时标记出来，Web 与 MCP 都能看到
+	for i := range result {
+		if isLocalNodeID(result[i].ID) {
+			continue
+		}
+		result[i].UpdateAvailable = version.IsNewer(result[i].Version, Version)
 	}
 	return result, nil
 }
@@ -761,6 +835,120 @@ func (s *Service) FileDownload(ctx context.Context, nodeID, path string) (interf
 	}
 	s.Audit.Record(ctx, "file.download", nodeID, policy.CapFile, audit.SafeParameters(map[string]string{"path": path}), started, nil)
 	return reader, nil
+}
+
+// UpdateCheck 遍历已连接节点，找出版本比本机新的，并在该节点上定位可用产物。
+func (s *Service) UpdateCheck(ctx context.Context) (map[string]any, error) {
+	if err := s.Authorize(ctx, "update.check", policy.CapBase); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	hint := s.Settings()["update_artifact"]
+	nodes, err := s.ListNodes()
+	if err != nil {
+		return nil, err
+	}
+	updates := []selfupdate.Candidate{}
+	considered := 0
+	for _, node := range nodes {
+		if isLocalNodeID(node.ID) || strings.TrimSpace(node.Version) == "" {
+			continue
+		}
+		considered++
+		if !version.IsNewer(node.Version, Version) {
+			continue
+		}
+		entry, findErr := selfupdate.FindArtifact(ctx, s.Files, node.ID, hint)
+		if findErr != nil {
+			continue
+		}
+		updates = append(updates, selfupdate.Candidate{
+			NodeID: node.ID, NodeName: node.Name, NodeVersion: node.Version,
+			Artifact: entry.Path, Size: entry.Size,
+			IsArchive: strings.HasSuffix(strings.ToLower(entry.Path), ".zip"),
+			UpdatedAt: entry.ModTime.UTC().Format(time.RFC3339),
+		})
+	}
+	s.Audit.Record(ctx, "update.check", "", policy.CapBase,
+		audit.SafeParameters(map[string]string{"found": strconv.Itoa(len(updates)), "considered": strconv.Itoa(considered)}),
+		started, nil)
+	return map[string]any{
+		"self_version": Version,
+		"updates":      updates,
+		"considered":   considered,
+		"hint":         hint,
+	}, nil
+}
+
+// UpdatePrepare 从节点下载产物并解出本平台二进制，完成校验；不替换、不重启。
+// 返回的 binary_path 交给 UpdateApplyBinary 使用（调用方应在响应发出后再调用）。
+func (s *Service) UpdatePrepare(ctx context.Context, nodeID, artifact string) (map[string]any, error) {
+	if err := s.Authorize(ctx, "update.download", policy.CapBase); err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	node, err := s.GetNode(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(node.Version) == "" || !version.IsNewer(node.Version, Version) {
+		return nil, apperrors.New(apperrors.InvalidArgument, "该节点的版本不比本机新")
+	}
+	if strings.TrimSpace(artifact) == "" {
+		entry, findErr := selfupdate.FindArtifact(ctx, s.Files, nodeID, s.Settings()["update_artifact"])
+		if findErr != nil {
+			s.Audit.Record(ctx, "update.download", nodeID, policy.CapBase, "", started, findErr)
+			return nil, findErr
+		}
+		artifact = entry.Path
+	}
+	destDir := filepath.Join(s.Store.DataDir(), "update")
+	local, size, err := selfupdate.Download(ctx, s.Files, nodeID, artifact, destDir)
+	if err != nil {
+		s.Audit.Record(ctx, "update.download", nodeID, policy.CapBase, audit.SafeParameters(map[string]string{"artifact": artifact}), started, err)
+		return nil, err
+	}
+	digest, _ := selfupdate.FileSHA256(local)
+	binary, err := selfupdate.Extract(local, destDir)
+	if err != nil {
+		s.Audit.Record(ctx, "update.download", nodeID, policy.CapBase, audit.SafeParameters(map[string]string{"artifact": artifact}), started, err)
+		return nil, err
+	}
+	if err := selfupdate.VerifyArtifact(binary); err != nil {
+		s.Audit.Record(ctx, "update.download", nodeID, policy.CapBase, audit.SafeParameters(map[string]string{"artifact": artifact}), started, err)
+		return nil, err
+	}
+	executable := executablePath()
+	s.Audit.Record(ctx, "update.download", nodeID, policy.CapBase,
+		audit.SafeParameters(map[string]string{"artifact": artifact, "sha256": digest, "bytes": strconv.FormatInt(size, 10)}), started, nil)
+	return map[string]any{
+		"node_id":      nodeID,
+		"node_version": node.Version,
+		"artifact":     artifact,
+		"local_path":   local,
+		"binary_path":  binary,
+		"size":         size,
+		"sha256":       digest,
+		"executable":   executable,
+	}, nil
+}
+
+// UpdateApplyBinary 替换本机二进制并重启。
+// Unix 上用 syscall.Exec 原地替换（不会返回）；Windows 上先改名旧文件、写入新文件、
+// 拉起新进程，然后由调用方关闭旧进程。
+func (s *Service) UpdateApplyBinary(binaryPath string) error {
+	executable := executablePath()
+	args := append([]string{executable}, os.Args[1:]...)
+	s.Audit.Record(context.Background(), "update.apply", "", policy.CapBase,
+		audit.SafeParameters(map[string]string{"binary": binaryPath, "executable": executable}), time.Now(), nil)
+	restarted, err := selfupdate.Apply(binaryPath, args)
+	if err != nil {
+		return err
+	}
+	if restarted {
+		slog.Info("新版本已启动，本进程即将退出", "executable", executable)
+	}
+	return nil
 }
 
 func (s *Service) ListTunnels() ([]model.Tunnel, error) { return s.Tunnels.List() }

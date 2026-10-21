@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/npa/npa/internal/model"
 	"github.com/npa/npa/internal/service"
@@ -165,5 +166,76 @@ func TestPortMappingRejectsPublicTarget(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("public target must be rejected, got %d", response.StatusCode)
+	}
+}
+
+// Web 退出服务：返回 stopping 并触发注入的优雅关闭钩子，同时留下审计。
+func TestShutdownEndpointTriggersGracefulHook(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	app := service.New(store)
+	server := New(app, fakeMCP{})
+	called := make(chan struct{}, 1)
+	server.ShutdownFunc = func() { called <- struct{}{} }
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+	defer app.Close()
+
+	response, err := http.Post(ts.URL+"/api/shutdown", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("退出接口返回 %d", response.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["stopping"] != true {
+		t.Fatalf("响应应先告知正在停止: %#v", payload)
+	}
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShutdownFunc 没有被调用")
+	}
+	events, err := app.AuditEvents(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Operation == "service.shutdown" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("退出操作必须写审计: %#v", events)
+	}
+}
+
+// 未注入钩子时应明确拒绝，而不是假装成功。
+func TestShutdownEndpointWithoutHook(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	app := service.New(store)
+	defer app.Close()
+	ts := httptest.NewServer(New(app, fakeMCP{}).Handler())
+	defer ts.Close()
+	response, err := http.Post(ts.URL+"/api/shutdown", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusOK {
+		t.Fatal("没有关闭钩子时不应返回成功")
 	}
 }

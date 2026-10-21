@@ -21,11 +21,14 @@ type Info struct {
 
 type Manager struct {
 	directory string
-	mu        sync.Mutex
-	process   *Process
-	info      Info
-	status    string
-	lastError string
+	// InitTimeout 是插件 initialize 握手的超时（默认 5s）。
+	// 留成字段是为了在慢盘/高负载环境（比如并行跑测试）里能放宽。
+	InitTimeout time.Duration
+	mu          sync.Mutex
+	process     *Process
+	info        Info
+	status      string
+	lastError   string
 }
 
 func NewManager(directory string) *Manager {
@@ -101,7 +104,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		m.mu.Unlock()
 	}()
-	initCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	initTimeout := m.InitTimeout
+	if initTimeout <= 0 {
+		initTimeout = 5 * time.Second
+	}
+	initCtx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
 	var info Info
 	if err := process.Request(initCtx, "plugin.initialize", map[string]any{"protocol_version": "1"}, &info); err != nil {

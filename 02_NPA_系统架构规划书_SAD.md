@@ -216,6 +216,9 @@ cmd/npa
       +-- discovery     # Phase 3
       +-- relay         # Phase 3
       +-- peer          # Phase 3 反向接入（Hub=上级 / Agent=下级）
+      +-- version       # 版本比较（判断对端是否比本机新）
+      +-- autostart     # 开机自启动（registry / launchd / systemd / xdg）
+      +-- selfupdate    # 从节点拉产物、校验、替换本机二进制
       +-- portmap       # Phase 3 端口映射（独立于 tunnel）
 ```
 
@@ -1096,6 +1099,18 @@ mDNS 只在本广播域有效，上级无法主动发现子网节点，因此方
 6. **选路优先级**：本机直连 → peer 宣告子网 → 本机 SSH 节点 → peer 对端跳板串联 → 私网兜底试拨。
 7. **可观测**：`/api/peers` 返回 agent 状态（当前上级、候选、连接池、错误）与全部在线链路；节点详情标注"反向接入"。
 
+### 11.6 启动脚本契约（前台 / 后台）
+
+`run.sh` / `run.bat` 是产品的一部分，不只是打包附件：
+
+```text
+无 <数据目录>/hide_console 标记  →  前台阻塞执行，stdout/stderr 进控制台；Go 侧同时写 npa.log
+有 <数据目录>/hide_console 标记  →  后台异步启动（nohup / Start-Process -WindowStyle Hidden），
+                                    输出只进 <数据目录>/npa.log，控制台可直接关闭
+```
+
+标记由设置项 `hide_console` 写入/删除（`<数据目录>/hide_console`），因此**隐藏控制台是跨平台一致的能力**，不需要 Go 侧调用各平台的窗口 API，也不需要另出一个 windowsgui 变体。数据目录从 `--data-dir` 参数推断，默认 `~/.npa`。
+
 ---
 
 ## 12. Phase 4 Third-party Plugin Ecosystem
@@ -1365,7 +1380,10 @@ npa/
 │   ├── discovery/        # Phase 3
 │   ├── relay/            # Phase 3
 │   ├── portmap/          # Phase 3 端口映射（独立于 tunnel）
-│   └── peer/             # Phase 3 反向接入（protocol/hub/agent/discover/channels）
+│   ├── peer/             # Phase 3 反向接入（protocol/hub/agent/discover/channels）
+│   ├── version/          # 版本比较
+│   ├── autostart/        # 开机自启动（按平台 build tag 拆分）
+│   └── selfupdate/       # 从节点更新（zip 解包 / 校验 / 替换重启）
 ├── plugins/                 # 运行时插件目录（不属于 Core 源码依赖）
 │   ├── windows/
 │   ├── macos/
@@ -1670,6 +1688,8 @@ Go/native reference plugin
 | ADR-21 | 端口映射本机入口默认 loopback，非回环监听必须逐条映射显式开启 |
 | ADR-22 | 反向接入使用独立端口 `56710` 且默认监听局域网，Web 管理面 `56700` 保持回环；注册暂不鉴权（调试期），收紧时在注册入口加 token，协议不变 |
 | ADR-23 | peer 节点不实现 SSH 服务端：命令/终端走 NPA 自有通道，文件用 `pkg/sftp` client/server 跑在同一通道上 |
+| ADR-24 | 本机生命周期能力（自启动 / 隐藏控制台 / 退出 / 更新）由 Web 设置驱动；**隐藏控制台交给启动脚本实现**（读 `<数据目录>/hide_console` 标记决定前台阻塞还是后台异步），Go 侧只保证文件日志始终存在，避免各平台各写一套窗口隐藏逻辑 |
+| ADR-25 | 更新只从**已纳管的局域网节点**拉产物并由用户手动触发；v1 不做签名，但强制校验可执行魔数与体积下限，全过程写审计；不自动更新、不支持降级 |
 
 ---
 

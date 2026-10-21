@@ -26,9 +26,13 @@ type Node struct {
 	PeerSource string `json:"peer_source,omitempty"` // seed | probe | manual
 	// PeerRoutes 是该 peer 节点**对端**已纳管的 SSH 跳板，用于「NPA 映射 + SSH 映射」串联。
 	PeerRoutes []RemoteRoute `json:"peer_routes,omitempty"`
-	LastSeen   time.Time     `json:"last_seen,omitempty"`
-	CreatedAt  time.Time     `json:"created_at"`
-	UpdatedAt  time.Time     `json:"updated_at"`
+	// Version 是对端自报的 NPA 版本（peer 注册、mDNS TXT 的 ver）；纯 SSH 节点通常为空。
+	Version string `json:"version,omitempty"`
+	// UpdateAvailable 由 ListNodes 计算：该节点版本严格新于本机。
+	UpdateAvailable bool      `json:"update_available,omitempty"`
+	LastSeen        time.Time `json:"last_seen,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type Credential struct {

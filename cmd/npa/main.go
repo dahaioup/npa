@@ -5,11 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -130,7 +132,8 @@ func main() {
 	case "error":
 		level = slog.LevelError
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	// 日志同时写控制台与文件：前台模式两者都有，隐藏控制台（后台）模式只剩文件
+	slog.SetDefault(slog.New(slog.NewTextHandler(logWriter(dataDirPath(*dataDir)), &slog.HandlerOptions{Level: level})))
 
 	store, err := state.Open(*dataDir)
 	if err != nil {
@@ -147,9 +150,11 @@ func main() {
 		}
 		mcpHTTPHandler.ServeHTTP(w, r)
 	})}
+	webHandler := web.New(app, mcpManager)
+	webHandler.ShutdownFunc = requestShutdown // Web「退出服务」按钮走这条优雅关闭路径
 	peerSupervisor := &listenerSupervisor{
 		name:    "peer",
-		handler: web.New(app, mcpManager).PeerHandler(),
+		handler: webHandler.PeerHandler(),
 		address: func(string) string { return peerAddress(app.Settings()) },
 	}
 	app.OnSettingsChanged = func() {
@@ -176,7 +181,7 @@ func main() {
 
 	webServer := &http.Server{
 		Addr:              "127.0.0.1:56700",
-		Handler:           web.New(app, mcpManager).Handler(),
+		Handler:           webHandler.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	webErr := make(chan error, 1)
@@ -204,6 +209,9 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	select {
 	case <-stop:
+		slog.Info("shutdown requested by signal")
+	case <-stopSignal:
+		slog.Info("shutdown requested from web")
 	case err := <-webErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("web server stopped", "error", err)
@@ -223,6 +231,51 @@ func peerScope(settings map[string]string) string {
 		return ""
 	}
 	return settings["peer_bind_scope"]
+}
+
+// stopSignal 让 Web「退出服务」与 Ctrl+C 走同一条优雅关闭路径。
+var stopSignal = make(chan struct{}, 1)
+
+func requestShutdown() {
+	select {
+	case stopSignal <- struct{}{}:
+	default: // 已经在关闭流程里
+	}
+}
+
+const logRotateSize = 10 << 20
+
+func dataDirPath(flagValue string) string {
+	if value := strings.TrimSpace(flagValue); value != "" {
+		return value
+	}
+	dir, err := state.DefaultDataDir()
+	if err != nil {
+		return "."
+	}
+	return dir
+}
+
+// logWriter 同时输出到控制台与日志文件：前台模式两者都有，
+// 隐藏控制台（后台）模式只剩文件，所以文件日志必须始终存在。
+func logWriter(dataDir string) io.Writer {
+	full := filepath.Join(dataDir, "npa.log")
+	rotateIfNeeded(full)
+	file, err := os.OpenFile(full, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		slog.Error("cannot open log file, console only", "path", full, "error", err)
+		return os.Stderr
+	}
+	return io.MultiWriter(os.Stderr, file)
+}
+
+func rotateIfNeeded(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < logRotateSize {
+		return
+	}
+	_ = os.Remove(path + ".1")
+	_ = os.Rename(path, path+".1")
 }
 
 func parseInt(value string) int {

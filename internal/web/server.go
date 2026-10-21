@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -43,6 +44,8 @@ type Server struct {
 	app      *service.Service
 	mcp      MCPStatus
 	upgrader websocket.Upgrader
+	// ShutdownFunc 由 main 注入：Web「退出服务」按钮触发与 Ctrl+C 相同的优雅关闭。
+	ShutdownFunc func()
 }
 
 func New(app *service.Service, mcp MCPStatus) *Server {
@@ -91,6 +94,7 @@ func decodeJSON(r *http.Request, target any) error {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/overview", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.app.Overview()) })
+	mux.HandleFunc("GET /api/system", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.app.SystemInfo()) })
 	mux.HandleFunc("GET /api/nodes", s.handleNodes)
 	mux.HandleFunc("POST /api/nodes", s.handleNodeSave)
 	mux.HandleFunc("DELETE /api/nodes/{id}", s.handleNodeDelete)
@@ -118,6 +122,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/webproxy/open", s.handleOpenWeb)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
 	mux.HandleFunc("PUT /api/settings", s.handleSettingsSave)
+	mux.HandleFunc("POST /api/shutdown", s.handleShutdown)
+	mux.HandleFunc("POST /api/update/check", s.handleUpdateCheck)
+	mux.HandleFunc("POST /api/update/apply", s.handleUpdateApply)
 	mux.HandleFunc("GET /api/mcp", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.mcp.Status()) })
 	mux.HandleFunc("GET /api/discovery", s.handleDiscoveryNodes)
 	mux.HandleFunc("POST /api/discovery/refresh", s.handleDiscoveryRefresh)
@@ -573,6 +580,46 @@ func (s *Server) handlePortMappingDelete(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]bool{"deleted": true})
 }
 
+// handleUpdateCheck 找出版本比本机新的节点及其上的可用产物。
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	result, err := s.app.UpdateCheck(policy.WithSource(r.Context(), policy.SourceWeb))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
+// handleUpdateApply 先把下载与校验结果发出去，再异步替换二进制并重启：
+// Unix 上替换用 exec 直接接管当前进程（不返回），Windows 上拉起新进程后旧进程优雅退出。
+func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		NodeID   string `json:"node_id"`
+		Artifact string `json:"artifact"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.app.UpdatePrepare(policy.WithSource(r.Context(), policy.SourceWeb), request.NodeID, request.Artifact)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, result)
+	binaryPath, _ := result["binary_path"].(string)
+	go func() {
+		time.Sleep(300 * time.Millisecond) // 让响应先发出去
+		if err := s.app.UpdateApplyBinary(binaryPath); err != nil {
+			slog.Error("apply update failed", "error", err)
+			return
+		}
+		if s.ShutdownFunc != nil {
+			s.ShutdownFunc()
+		}
+	}()
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, s.app.Settings())
 }
@@ -588,6 +635,22 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.app.Settings())
+}
+
+// handleShutdown 让 Web 能正常退出服务，避免只能任务管理器强杀：
+// 先把响应发出去，再异步走与 Ctrl+C 完全相同的优雅关闭路径。
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if s.ShutdownFunc == nil {
+		writeError(w, apperrors.New(apperrors.NotSupported, "当前实例不支持从 Web 退出"))
+		return
+	}
+	s.app.Audit.Record(policy.WithSource(r.Context(), policy.SourceWeb), "service.shutdown", "",
+		policy.CapBase, "", time.Now(), nil)
+	writeJSON(w, 200, map[string]any{"stopping": true})
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		s.ShutdownFunc()
+	}()
 }
 
 func (s *Server) handleDiscoveryNodes(w http.ResponseWriter, r *http.Request) {

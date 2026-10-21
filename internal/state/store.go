@@ -36,9 +36,21 @@ var (
 )
 
 type Store struct {
-	db  *bolt.DB
-	mu  sync.RWMutex
-	key []byte
+	db      *bolt.DB
+	mu      sync.RWMutex
+	key     []byte
+	dataDir string
+}
+
+// DataDir 返回状态库所在目录，日志、更新缓存与自启动标记都放在它下面。
+func (s *Store) DataDir() string {
+	if s == nil || s.dataDir == "" {
+		if dir, err := DefaultDataDir(); err == nil {
+			return dir
+		}
+		return "."
+	}
+	return s.dataDir
 }
 
 func DefaultDataDir() (string, error) {
@@ -69,7 +81,7 @@ func Open(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	store := &Store{db: db, key: key}
+	store := &Store{db: db, key: key, dataDir: dataDir}
 	if err := store.initialize(); err != nil {
 		db.Close()
 		return nil, err
@@ -144,6 +156,9 @@ func defaults() map[string]string {
 		"peer_probe_subnets":    "",
 		"peer_pool_size":        "4",
 		"peer_auto_trust":       "true",
+		"autostart":             "false",
+		"hide_console":          "false",
+		"update_artifact":       "",
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -71,6 +72,8 @@ func TestProcessCrashDoesNotPanicCore(t *testing.T) {
 	}
 	t.Setenv("NPA_PLUGIN_HELPER", "1")
 	manager := NewManager(directory)
+	// 这个用例要复制整个测试二进制再拉起来，并行跑全量时磁盘压力大，放宽握手超时
+	manager.InitTimeout = 60 * time.Second
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}

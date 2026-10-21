@@ -322,6 +322,7 @@ func (m *Manager) resolveWithDnsSD(ctx context.Context, instance string) {
 		ID: id, DisplayID: values["id"], Name: values["name"], Address: selectedAddress.String(), Port: port,
 		AuthMethod: "discovered", Protocol: "discovered", Status: "discovered",
 		Capabilities: splitCSV(values["caps"]), ReachableSubnets: splitCSV(values["subnets"]),
+		Version:    strings.TrimSpace(values["ver"]),
 		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	if node.Name == "" {
@@ -390,6 +391,7 @@ func parseEntry(entry *zeroconf.ServiceEntry) (model.Node, bool) {
 	return model.Node{
 		ID: id, DisplayID: values["id"], Name: name, Address: address, Port: entry.Port, Username: "", AuthMethod: "discovered",
 		Protocol: "discovered", Status: "discovered", Capabilities: capabilities, ReachableSubnets: subnets,
+		Version:    strings.TrimSpace(values["ver"]),
 		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}, true
 }
