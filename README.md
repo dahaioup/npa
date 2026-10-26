@@ -93,6 +93,32 @@ mDNS 是链路本地组播，跨不了三层网段，所以上级（本机 `192.
 - **跨域升级推送**：「版本与更新」的节点推送升级对跨域节点同样可用（探测 → 传包 → 写脚本 → 执行替换重启，一条代理链走通）；端到端验证见 `internal/peer/e2e_test.go` 的 `TestCrossUpperPushAndTunnel`；
 - **使用前提**：中间持有者（B）的地址必须能被 A 访问；NAT/多网卡环境在 B 上设置 `peer_advertise` 显式通告入口。
 
+### 跨多域的文件分发流程
+
+A 要给任意深度的节点 N 传文件（或从 N 拉文件）时，按下面的顺序选路，逐级降级、调用方无感（`internal/file/service.go` 的 `httpTarget`）：
+
+```text
+A 发起 FileUpload / OpenRead / Write
+  │
+  ├─ ① 直连 HTTP：节点 N 在本机反向链路上（有直连基址）
+  │     A ──HTTP PUT /api/file/upload（流式）──▶ N:56701
+  │
+  ├─ ② 跨域代理：N 不在直连链路（跨域，只存在于拓扑）
+  │     A ──上级代理链 A→B→N──▶ N 自己的 127.0.0.1:56701
+  │     （DialNode 直连失败 → 按 N.ID 在拓扑找持有上级 B → 经 B 中转）
+  │
+  └─ ③ SFTP 回退：以上 HTTP 全部失败（如旧版本节点）
+        走 SFTP-over-WS 数据通道（会占用共享通道池，逐步淘汰）
+```
+
+要点：
+
+- **全链流式**：①② 都是纯 HTTP 流式传输，不限文件大小、不整读进内存；升级包十几 MB 一样直过。整读进内存的只有 `file.read`/`file.write` 小文件接口（4 MiB 上限，给 MCP JSON 通道保命）。
+- **传输不占控制面**：代理链是按需拨、传完即关的独立连接，不占用心跳/exec/PTY 共享的通道池。
+- **多跳同理**：A→B→C→N 三跳时，② 的代理回退逐跳递归（`RequireChild`），A 不需要知道 C 的存在。
+- **超时语义**：拨号 3s、响应头 5s；总时长由调用方 ctx 控制，大文件不限总时长。代理链路上每个请求新建连接（禁 keep-alive），避免与单连接数据面冲突。
+- **典型应用——跨域升级推送**：`/api/update/push` 对跨域节点 = ② 传升级包（流式 HTTP）+ `/api/exec` 探测与重启，一条代理链走通；端到端验证见 `TestCrossUpperPushAndTunnel`。
+
 架构细节见 [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)（含整体分层、Mesh 数据面与分域演进三张图）。
 
 ## 本机管理（设置页）
