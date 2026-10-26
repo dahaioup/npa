@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -62,6 +62,8 @@ type Service struct {
 	started           time.Time
 	stop              chan struct{}
 	stopOnce          sync.Once
+	requireInflight   sync.Map // nodeID -> *sync.WaitGroup：同目标在途 require 去重
+	holderCooldown    sync.Map // holderAddress -> time.Time：require 失败冷却
 	topologyCache     *topologyCacheEntry
 	downloadTokens    map[string]downloadToken
 	mu                sync.RWMutex
@@ -254,16 +256,53 @@ func (s *Service) DialNode(ctx context.Context, nodeID, target string) (net.Conn
 	return nil, err
 }
 
+// holderCooldownWindow require 失败后该持有者的冷却时长：期间对它的代理
+// 请求直接失败，不再每次撞墙（拓扑里持有者断链是常态，等它自己刷新）。
+const holderCooldownWindow = 30 * time.Second
+
 // dialNodeViaUpper 是跨域兜底：按节点 ID 找到持有它的上级，请它代理转发。
+// 同一目标节点的在途协商自动共享（后来的等待复用结果），避免重试风暴；
+// 持有者协商失败后进入 30s 冷却，期间直接报错不再反复敲它。
 func (s *Service) dialNodeViaUpper(ctx context.Context, nodeID, target string) (net.Conn, error) {
 	if !s.RelayFallbackEnabled() {
 		return nil, apperrors.New(apperrors.NodeOffline, "跨上级代理回退未启用（peer_relay_fallback）")
 	}
+	if inflight, busy := s.requireInflight.LoadOrStore(nodeID, &sync.WaitGroup{}); busy {
+		wg := inflight.(*sync.WaitGroup)
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		// 首个协商已结束：直接再试一次（缓存效应在 hub 侧），
+		// 失败也如实返回，不再叠加第二轮协商。
+	}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	s.requireInflight.Store(nodeID, wg)
+	defer func() {
+		wg.Done()
+		s.requireInflight.Delete(nodeID)
+	}()
 	holder, ok := s.HolderForNode(ctx, nodeID)
 	if !ok {
 		return nil, apperrors.New(apperrors.NodeOffline, "拓扑里找不到该节点的持有上级")
 	}
-	return s.DialViaUpper(ctx, holder, nodeID, target, "")
+	if raw, cooling := s.holderCooldown.Load(holder); cooling {
+		if until, _ := raw.(time.Time); time.Now().Before(until) {
+			return nil, apperrors.New(apperrors.NodeOffline, fmt.Sprintf("持有者 %s 协商刚失败，冷却中（%.0fs 后重试）", holder, holderCooldownWindow.Seconds()))
+		}
+		s.holderCooldown.Delete(holder)
+	}
+	conn, err := s.DialViaUpper(ctx, holder, nodeID, target, "")
+	if err != nil {
+		s.holderCooldown.Store(holder, time.Now().Add(holderCooldownWindow))
+		return nil, err
+	}
+	s.holderCooldown.Delete(holder)
+	return conn, nil
 }
 
 // dialNodeMesh 经反向链路或跨上级代理拨到节点自己的 mesh 端口（127.0.0.1:56701）。

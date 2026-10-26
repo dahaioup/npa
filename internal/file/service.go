@@ -3,6 +3,7 @@ package file
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -85,22 +87,35 @@ func (s *Service) httpTarget(ctx context.Context, nodeID string) (*http.Client, 
 
 func (s *Service) httpUploadWith(ctx context.Context, client *http.Client, base, remotePath string, source io.Reader) (int64, error) {
 	target := base + "/api/file/upload?path=" + url.QueryEscape(remotePath)
-	counting := &countingReader{Reader: source}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, counting)
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var sent atomic.Int64
+	counting := &progressReader{r: source, n: &sent}
+	stopWatch := watchProgress(&sent, ioIdleTimeout, cancel)
+	defer stopWatch()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, target, counting)
 	if err != nil {
 		return 0, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return counting.n, err
+		return sent.Load(), err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return counting.n, fmt.Errorf("node returned %d: %s", resp.StatusCode, string(body))
+		return sent.Load(), fmt.Errorf("node returned %d: %s", resp.StatusCode, string(body))
 	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return counting.n, nil
+	// 大小回执校验：节点实际落盘字节数必须与发送量一致。
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var ack struct {
+		Bytes int64 `json:"bytes"`
+	}
+	_ = json.Unmarshal(body, &ack)
+	if ack.Bytes > 0 && ack.Bytes != sent.Load() {
+		return sent.Load(), fmt.Errorf("upload size mismatch: sent %d, node wrote %d", sent.Load(), ack.Bytes)
+	}
+	return sent.Load(), nil
 }
 
 // countingReader 统计已发给节点的字节数（上传报告要用真实发送量，
@@ -116,22 +131,94 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// ioIdleTimeout 客户端侧传输空闲上限：连续这么久没有任何字节进展就取消
+// 请求——大文件不限总时长，但静默死连接（NAT 断流 / 节点消失）必须能发现。
+const ioIdleTimeout = 60 * time.Second
+
+// progressReader 把读取进度记进原子计数器，供看门狗检测。
+type progressReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n.Add(int64(n))
+	return n, err
+}
+
+// watchProgress 启动看门狗：计数器连续 idle 无进展就调用 cancel 中断传输。
+// 返回停止函数（同步等待看门狗退出，无泄漏、无竞态）。
+func watchProgress(counter *atomic.Int64, idle time.Duration, cancel func()) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(idle / 2)
+		defer ticker.Stop()
+		last := counter.Load()
+		lastChange := time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				cur := counter.Load()
+				if cur != last {
+					last = cur
+					lastChange = time.Now()
+					continue
+				}
+				if time.Since(lastChange) >= idle {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(stop); <-done }
+}
+
+// watchedBody 包住下载响应体：读进度喂给看门狗，Close 时同步停表。
+type watchedBody struct {
+	io.ReadCloser
+	n    *atomic.Int64
+	stop func()
+}
+
+func (w *watchedBody) Read(p []byte) (int, error) {
+	n, err := w.ReadCloser.Read(p)
+	w.n.Add(int64(n))
+	return n, err
+}
+
+func (w *watchedBody) Close() error {
+	w.stop()
+	return w.ReadCloser.Close()
+}
+
 func (s *Service) httpOpenReadWith(ctx context.Context, client *http.Client, base, remotePath string) (io.ReadCloser, error) {
 	target := base + "/api/file/download?path=" + url.QueryEscape(remotePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
+	reqCtx, cancel := context.WithCancel(ctx)
+	req = req.WithContext(reqCtx)
 	resp, err := client.Do(req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		resp.Body.Close()
+		cancel()
 		return nil, fmt.Errorf("node returned %d: %s", resp.StatusCode, string(body))
 	}
-	return resp.Body, nil
+	var progress atomic.Int64
+	stopWatch := watchProgress(&progress, ioIdleTimeout, cancel)
+	return &watchedBody{ReadCloser: resp.Body, n: &progress, stop: stopWatch}, nil
 }
 
 func cleanPath(value string) string {

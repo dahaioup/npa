@@ -16,16 +16,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // FileAPI 把本机文件系统以纯 HTTP 暴露给上级：大文件传输不再走
 // SFTP-over-WS 数据通道，避免占用/拖垮通道池。
 // 注意：按现阶段约定暂不挂任何鉴权（权限体系后续统一重设计）。
-type FileAPI struct{}
+type FileAPI struct {
+	gate *ioGate
+}
 
 // NewFileAPI 构造节点本机文件 API。
-func NewFileAPI() *FileAPI { return &FileAPI{} }
+func NewFileAPI() *FileAPI { return &FileAPI{gate: newIOGate(maxConcurrentIO)} }
 
 // Register 把文件端点挂到 mux 上。上级使用的入口：
 //
@@ -56,6 +59,79 @@ type execRequest struct {
 	TimeoutMS int    `json:"timeout_ms"`
 }
 
+const (
+	// execOutputLimit 单条命令 stdout/stderr 的回传上限，超出截断并打
+	// truncated 标志——防止 `cat 大文件` 之类把节点内存吃光。
+	execOutputLimit = 2 << 20
+	// ioIdleTimeout 传输空闲上限：连续这么久没有任何字节进展即断开。
+	// 大文件不限总时长，但死连接（NAT 断流 / 对端消失）必须能被发现。
+	ioIdleTimeout = 60 * time.Second
+	// maxConcurrentIO 单节点同时处理的 upload / exec 数上限，超出直接
+	// 拒绝（HTTP 429），避免多个上级/重试把节点打满。
+	maxConcurrentIO = 2
+)
+
+// ioGate 按目标键（固定 "local"）做并发闸门。
+type ioGate struct {
+	mu    sync.Mutex
+	busy  map[string]int
+	limit int
+}
+
+func newIOGate(limit int) *ioGate { return &ioGate{busy: map[string]int{}, limit: limit} }
+
+// acquire 占用一个槽位；占不到返回 false。
+func (g *ioGate) acquire(key string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.busy[key] >= g.limit {
+		return false
+	}
+	g.busy[key]++
+	return true
+}
+
+func (g *ioGate) release(key string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.busy[key]--
+}
+
+// idleBody 包装请求体：每次 Read 前把连接读截止时间延后 idle——连续
+// idle 没有字节进展就返回错误（发现静默断掉的死连接），大文件总时长不限。
+type idleBody struct {
+	rc   *http.ResponseController
+	body io.Reader
+}
+
+func (b idleBody) Read(p []byte) (int, error) {
+	_ = b.rc.SetReadDeadline(time.Now().Add(ioIdleTimeout))
+	return b.body.Read(p)
+}
+
+// limitedBuffer 最多累计 limit 字节，超出丢弃并置 truncated。
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if room := b.limit - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			b.buf.Write(p[:room])
+			b.truncated = true
+		} else {
+			b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string { return b.buf.String() }
+
 // handleExec 在本机执行命令并回传 JSON 结果（对标反向链路 TypeExec 通道，
 // 让"经上级代理拨到本机 mesh 端口"的跨域场景也能执行命令）。
 func (f *FileAPI) handleExec(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +149,11 @@ func (f *FileAPI) handleExec(w http.ResponseWriter, r *http.Request) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	if !f.gate.acquire("io") {
+		fileError(w, http.StatusTooManyRequests, "node busy: another exec/upload is running (limit %d)", maxConcurrentIO)
+		return
+	}
+	defer f.gate.release("io")
 	ctx, cancel := context.WithTimeout(r.Context(), timeout+15*time.Second)
 	defer cancel()
 	var shell string
@@ -90,7 +171,8 @@ func (f *FileAPI) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeFileJSON(w, map[string]any{"stdout": "", "stderr": err.Error(), "exit_code": 127, "duration_ms": 0})
 		return
 	}
-	var outBuf, errBuf bytes.Buffer
+	var outBuf, errBuf limitedBuffer
+	outBuf.limit, errBuf.limit = execOutputLimit, execOutputLimit
 	_, _ = io.Copy(&outBuf, stdout)
 	_, _ = io.Copy(&errBuf, stderr)
 	runErr := cmd.Wait()
@@ -106,6 +188,7 @@ func (f *FileAPI) handleExec(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"stdout":      outBuf.String(),
 		"stderr":      errBuf.String(),
+		"truncated":   outBuf.truncated || errBuf.truncated,
 		"exit_code":   exitCode,
 		"duration_ms": time.Since(started).Milliseconds(),
 	})
@@ -192,18 +275,38 @@ func (f *FileAPI) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 func (f *FileAPI) handleUpload(w http.ResponseWriter, r *http.Request) {
 	target := cleanFileSystemPath(r.URL.Query().Get("path"))
+	if !f.gate.acquire("io") {
+		fileError(w, http.StatusTooManyRequests, "node busy: another exec/upload is running (limit %d)", maxConcurrentIO)
+		return
+	}
+	defer f.gate.release("io")
 	if dir := filepath.Dir(target); dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	file, err := os.Create(target)
+	// 原子写：先写同目录临时文件，全部收完再 rename——中断不会留半截目标文件。
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".npa-upload-*")
 	if err != nil {
-		fileError(w, http.StatusBadRequest, "cannot create %q: %v", target, err)
+		fileError(w, http.StatusBadRequest, "cannot create temp file: %v", err)
 		return
 	}
-	defer file.Close()
-	written, err := io.Copy(file, r.Body)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // 成功 rename 后这句是 no-op
+	written, err := io.Copy(tmp, idleBody{rc: http.NewResponseController(w), body: r.Body})
 	if err != nil {
+		tmp.Close()
 		fileError(w, http.StatusInternalServerError, "upload interrupted after %d bytes: %v", written, err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		fileError(w, http.StatusInternalServerError, "cannot flush temp file: %v", err)
+		return
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		fileError(w, http.StatusInternalServerError, "cannot chmod temp file: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		fileError(w, http.StatusInternalServerError, "cannot move into place: %v", err)
 		return
 	}
 	writeFileJSON(w, map[string]any{"path": target, "bytes": written})
