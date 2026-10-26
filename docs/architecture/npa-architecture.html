@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NPA 架构总览</title>
+<style>
+  :root{
+    --ink:#0f172a; --muted:#5b6779; --faint:#8a94a6; --line:#d9dfe8; --line2:#e8edf3;
+    --bg:#f2f5f9; --card:#ffffff;
+    --blue:#1d4ed8; --blue-soft:#ecf1fe;
+    --teal:#0f766e; --teal-soft:#e6f5f3;
+    --amber:#b45309; --amber-soft:#fdf4e5;
+    --violet:#6d28d9; --violet-soft:#f2ecfe;
+    --slate:#334155; --slate-soft:#eef2f7;
+    --rose:#be123c; --rose-soft:#fdeef1;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink)}
+  body{
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,-apple-system,"Segoe UI",sans-serif;
+    font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;
+    width:1680px;padding:34px 40px 26px;display:flex;flex-direction:column;gap:18px;
+  }
+  code,.mono{font-family:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:11px}
+  h1,h2,h3,p{margin:0}
+
+  /* ---------- header ---------- */
+  header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding:0 4px}
+  .brand{display:flex;align-items:center;gap:16px}
+  .logo{width:56px;height:56px;border-radius:15px;background:linear-gradient(145deg,#1e3a8a,#1d4ed8 55%,#0f766e);
+        color:#fff;display:grid;place-items:center;font-weight:700;font-size:27px;letter-spacing:-1px;
+        box-shadow:0 8px 20px #1d4ed833}
+  h1{font-size:30px;letter-spacing:.5px;font-weight:700}
+  .brand p{color:var(--muted);font-size:13px;margin-top:3px}
+  .badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:660px}
+  .badge{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 11px;font-size:11.5px;color:var(--slate);
+         display:flex;align-items:center;gap:6px}
+  .dot{width:7px;height:7px;border-radius:50%;background:#16a34a}
+  .badge b{font-weight:600;color:var(--ink)}
+
+  /* ---------- main split ---------- */
+  .split{display:grid;grid-template-columns:minmax(0,1fr) 372px;gap:18px;align-items:start}
+  .main{display:flex;flex-direction:column;gap:0;min-width:0}
+  aside{display:flex;flex-direction:column;gap:14px}
+
+  /* ---------- callers ---------- */
+  .callers{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:8px}
+  .caller{background:#fff;border:1px solid var(--line);border-radius:13px;padding:13px 14px;position:relative;overflow:hidden}
+  .caller:before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--blue)}
+  .caller:nth-child(2):before{background:var(--teal)}
+  .caller:nth-child(3):before{background:var(--violet)}
+  .caller h3{font-size:14px;display:flex;align-items:center;gap:7px}
+  .tag{font-size:10px;font-weight:600;letter-spacing:.3px;padding:2px 7px;border-radius:5px;background:var(--slate-soft);color:var(--slate)}
+  .caller p{color:var(--muted);font-size:11.5px;margin:5px 0 7px}
+  .caller .mono{color:var(--blue);background:var(--blue-soft);border-radius:5px;padding:3px 6px;display:inline-block}
+
+  /* ---------- flow connector ---------- */
+  .flow{display:flex;align-items:center;gap:10px;padding:0 0 0 118px;height:34px;position:relative;color:var(--faint)}
+  .flow:before{content:"";width:2px;height:100%;background:linear-gradient(#cbd5e1,#94a3b8);margin-left:14px}
+  .flow .note{font-size:11px;color:var(--muted);background:var(--bg);padding:0 6px;position:relative;left:-2px}
+  .flow .glyph{position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:12px;color:#94a3b8}
+
+  /* ---------- layer ---------- */
+  .layer{background:#fff;border:1px solid var(--line);border-radius:16px;display:grid;grid-template-columns:100px minmax(0,1fr);
+         box-shadow:0 1px 2px #0f172a08;overflow:hidden}
+  .rail{padding:16px 10px;border-right:1px dashed var(--line);background:linear-gradient(180deg,#fbfcfe,#f6f8fc);
+        display:flex;flex-direction:column;gap:2px;align-items:center;text-align:center}
+  .rail b{font-size:23px;letter-spacing:-1px;color:var(--blue);font-weight:700;line-height:1}
+  .rail span{font-size:12.5px;font-weight:600;margin-top:6px;letter-spacing:1px}
+  .rail em{font-style:normal;font-size:9.5px;color:var(--faint);letter-spacing:.6px;text-transform:uppercase}
+  .body{padding:14px 16px 15px;min-width:0}
+  .body>h2{font-size:13px;font-weight:600;color:var(--slate);margin-bottom:10px;display:flex;align-items:center;gap:8px}
+  .body>h2 .mono{color:var(--faint);font-weight:400}
+  .grid{display:grid;gap:10px}
+  .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .card{border:1px solid var(--line2);border-radius:10px;padding:10px 11px;background:#fcfdff}
+  .card h4{margin:0 0 3px;font-size:12.5px;font-weight:600;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+  .card h4 .mono{font-weight:400;color:var(--faint);font-size:9.5px}
+  .card p{font-size:11px;color:var(--muted);line-height:1.55}
+  .card ul{margin:5px 0 0;padding-left:13px;color:#3f4b5e;font-size:11px;line-height:1.62}
+  .card li::marker{color:#a9b6c8}
+  .card li b{font-weight:600;color:var(--ink)}
+  .card.accent{background:var(--blue-soft);border-color:#c9d8fb}
+  .card.accent h4{color:var(--blue)}
+  .card.warn{background:var(--amber-soft);border-color:#f3ddb5}
+  .card.warn h4{color:var(--amber)}
+  .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+  .chip{font-size:10px;padding:2px 6px;border-radius:4px;background:var(--slate-soft);color:var(--slate);white-space:nowrap}
+  .chip.blue{background:var(--blue-soft);color:var(--blue)}
+  .chip.teal{background:var(--teal-soft);color:var(--teal)}
+  .chip.violet{background:var(--violet-soft);color:var(--violet)}
+  .chip.amber{background:var(--amber-soft);color:var(--amber)}
+  .chip.rose{background:var(--rose-soft);color:var(--rose)}
+
+  /* ---------- aside ---------- */
+  .panel{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px 15px}
+  .panel h3{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:7px;margin-bottom:9px;color:var(--slate)}
+  .panel h3 .bar{width:3px;height:13px;border-radius:2px;background:var(--blue)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:11px}
+  .kv dt{color:var(--faint)}
+  .kv dd{margin:0;color:#3f4b5e}
+  .port-row{display:grid;grid-template-columns:64px 1fr;gap:2px 9px;padding:6px 0;border-bottom:1px dashed var(--line2);font-size:11px}
+  .port-row:last-child{border-bottom:0}
+  .port-row .p{font-family:"SF Mono",Menlo,monospace;font-size:11px;font-weight:600;color:var(--blue)}
+  .port-row .d b{font-weight:600;display:block;font-size:11px}
+  .port-row .d span{color:var(--muted);font-size:10.5px}
+  .bullets{margin:0;padding-left:14px;font-size:11px;line-height:1.7;color:#3f4b5e}
+  .bullets li::marker{color:#a9b6c8}
+  .bullets b{color:var(--ink);font-weight:600}
+
+  /* ---------- footer ---------- */
+  footer{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;display:flex;justify-content:space-between;
+         color:var(--faint);font-size:10.5px;gap:20px}
+  footer .mono{font-size:10px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo">N</div>
+    <div>
+      <h1>NPA 架构总览</h1>
+      <p>Node Proxy Agent · 局域网节点访问与 AI 自动化排障控制面</p>
+    </div>
+  </div>
+  <div class="badges">
+    <span class="badge"><span class="dot"></span>v0.4.1-phase3</span>
+    <span class="badge">单进程 · 单二进制</span>
+    <span class="badge">CGO_ENABLED=0</span>
+    <span class="badge">Go 1.27 · 21 个 internal 包</span>
+    <span class="badge">21 个 MCP 工具 · 55 条 HTTP 路由</span>
+  </div>
+</header>
+
+<div class="split">
+  <div class="main">
+
+    <div class="callers">
+      <div class="caller">
+        <h3>AI / IDE / Agent <span class="tag">MCP</span></h3>
+        <p>Streamable HTTP：initialize → tools/list → tools/call</p>
+        <span class="mono">http://127.0.0.1:56701/mcp</span>
+      </div>
+      <div class="caller">
+        <h3>浏览器 <span class="tag">Web UI</span></h3>
+        <p>原生单页，按需 fetch；终端走 WebSocket</p>
+        <span class="mono">REST / SSE / WS / /proxy/{id}/</span>
+      </div>
+      <div class="caller">
+        <h3>其它 NPA 节点 <span class="tag">Mesh</span></h3>
+        <p>下级主动出站注册并保持长连接，上级不需要入站端口</p>
+        <span class="mono">WebSocket + 首帧通道头</span>
+      </div>
+    </div>
+
+    <div class="flow"><span class="glyph">▼</span><span class="note">HTTP · SSE · WebSocket · MCP Streamable HTTP</span></div>
+
+    <section class="layer">
+      <div class="rail"><b>01</b><span>接入层</span><em>Ingress</em></div>
+      <div class="body">
+        <h2>两个入口，两种信任域 <span class="mono">localhost:56700 / mesh:56701</span></h2>
+        <div class="grid g2">
+          <div class="card">
+            <h4>Web 管理面 <span class="mono">internal/web/server.go · :56700</span></h4>
+            <p>固定回环监听，不随设置放开；浏览器与 curl 的本地管理入口。</p>
+            <div class="chips">
+              <span class="chip">42 条 REST 路由</span>
+              <span class="chip">SSE /api/events</span>
+              <span class="chip">PTY WS</span>
+              <span class="chip">/proxy/{id}/ 受控反代</span>
+              <span class="chip">静态 UI</span>
+            </div>
+          </div>
+          <div class="card">
+            <h4>Mesh 入口 <span class="mono">cmd/npa/main.go · :56701</span></h4>
+            <p>MCP 与节点通信共用一个端口，按路径分发；监听范围可热切换。</p>
+            <div class="chips">
+              <span class="chip blue">/mcp → MCP（mcp_enabled）</span>
+              <span class="chip amber">/api/peers/* · /api/info · /api/topology（peer_enabled）</span>
+              <span class="chip rose">/download/{token} 一次性</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="glyph">▼</span><span class="note">handler 一律调用 Service 方法；MCP 调用额外带 policy.SourceMCP</span></div>
+
+    <section class="layer">
+      <div class="rail"><b>02</b><span>编排层</span><em>Service</em></div>
+      <div class="body">
+        <h2>唯一的应用服务 <span class="mono">internal/service/service.go · 1299 行</span></h2>
+        <div class="grid g3">
+          <div class="card">
+            <h4>业务编排</h4>
+            <ul>
+              <li>节点：增删改、健康探测、本地 / SSH / peer 三种寻址</li>
+              <li>命令、终端、文件、隧道、端口映射、Relay、拓扑</li>
+              <li>设置热生效、更新检查 / 准备 / 推送、概览、审计查询</li>
+            </ul>
+          </div>
+          <div class="card accent">
+            <h4>横切面（MCP 硬门槛）</h4>
+            <ul>
+              <li><b>policy.Check</b>：仅 SourceMCP 校验 Capability，Web 本地管理不受限</li>
+              <li><b>速率限制</b>：固定窗口，按操作计数</li>
+              <li><b>audit.Record</b>：统一脱敏，成功与失败都落库</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>生命周期（main.go）</h4>
+            <ul>
+              <li>state.Open → service.New 装配 → MCP / Web / Peer</li>
+              <li>恢复隧道与端口映射、启动 mDNS 与 Plugin</li>
+              <li>Ctrl+C / Web「退出」同一条 5s 优雅关闭路径</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="glyph">▼</span><span class="note">每个能力是一个独立 Manager，通过 Repository 接口只依赖 Store</span></div>
+
+    <section class="layer">
+      <div class="rail"><b>03</b><span>能力层</span><em>Managers</em></div>
+      <div class="body">
+        <h2>九个能力管理器 + 三组系统集成 <span class="mono">能力可单独开关、单独审计</span></h2>
+        <div class="grid g3">
+          <div class="card">
+            <h4>SSH Manager <span class="mono">internal/ssh</span></h4>
+            <ul>
+              <li>x/crypto/ssh；TOFU 指纹、密钥 / 口令 / Agent</li>
+              <li>连接复用、Exec、交互 Shell（PTY）</li>
+              <li>数据面：<b>direct-tcpip</b> / forwarded-tcpip</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>File Service <span class="mono">internal/file</span></h4>
+            <ul>
+              <li>pkg/sftp：列目录 / 读 / 写 / 上传 / 下载 / 改名</li>
+              <li>寻址透明：SSH 节点走 SFTP，peer 节点走 WS 上的 SFTP</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Tunnel <span class="mono">internal/tunnel</span></h4>
+            <ul>
+              <li>Local / Remote / SOCKS5，KeepAlive</li>
+              <li>定义持久化，启动时按设置自动恢复</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Port Mapping <span class="mono">internal/portmap</span></h4>
+            <ul>
+              <li>本机监听 → 目标 IP:port，默认仅 127.0.0.1</li>
+              <li>转发路径自动选择：直连，否则经 Relay / 反向链路</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Relay <span class="mono">internal/relay</span></h4>
+            <ul>
+              <li>选路：直连优先 → 已信任且启用的健康节点单跳</li>
+              <li>数据面仍是 SSH / peer 通道，不自造协议</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Discovery <span class="mono">internal/discovery</span></h4>
+            <ul>
+              <li>mDNS/DNS-SD <b>_npa._tcp.local.</b>，5353/UDP</li>
+              <li>TXT：ID / 版本 / 入口 / 能力 / 可达子网；6h 清理陈旧记录</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Peer（Hub + Agent） <span class="mono">internal/peer</span></h4>
+            <ul>
+              <li><b>Hub</b>：注册、控制长连接、空闲连接池、跨上级协调</li>
+              <li><b>Agent</b>：种子 / mDNS / 网段探测 → /api/info 校验 → 注册、心跳、退避</li>
+              <li>通道首帧：open · exec · pty · fs · relay_open</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Desktop + Plugin <span class="mono">internal/desktop · internal/plugin</span></h4>
+            <ul>
+              <li>JSON-RPC 2.0 + Content-Length + stdio 子进程</li>
+              <li>插件优先，缺失 / 异常时回退内置脚本；截图 / 鼠标独立授权</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>系统集成 <span class="mono">selfupdate · autostart · console · version</span></h4>
+            <ul>
+              <li>自更新：下载 zip → 解包校验 → 替换二进制并重启</li>
+              <li>开机自启：注册表 / LaunchAgent / systemd / XDG</li>
+              <li>隐藏控制台、日志轮转、语义化版本比较</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="glyph">▼</span><span class="note">所有 Manager 通过 Repository 接口读写同一个 Store；凭据只在 Store 内解密</span></div>
+
+    <section class="layer">
+      <div class="rail"><b>04</b><span>基础设施</span><em>State</em></div>
+      <div class="body">
+        <h2>无配置文件：状态、凭据、审计都在本地数据目录 <span class="mono">~/.npa（可用 --data-dir 覆盖）</span></h2>
+        <div class="grid g4">
+          <div class="card">
+            <h4>Store <span class="mono">bbolt</span></h4>
+            <ul><li>settings / nodes / tunnels / port mappings</li><li>discovered / relay routes / audit</li></ul>
+          </div>
+          <div class="card">
+            <h4>凭据 <span class="mono">AES-GCM</span></h4>
+            <ul><li>master.key 独立存放</li><li>密文入库，不写日志、不回显</li></ul>
+          </div>
+          <div class="card">
+            <h4>审计 + 日志 <span class="mono">slog</span></h4>
+            <ul><li>结构化事件脱敏，保留 N 天</li><li>npa.log 10MB 轮转；可选隐藏控制台</li></ul>
+          </div>
+          <div class="card">
+            <h4>共享内核 <span class="mono">model · errors</span></h4>
+            <ul><li>统一数据模型与 JSON 形状</li><li>错误码 → HTTP 状态 / MCP 错误</li></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <aside>
+    <div class="panel">
+      <h3><span class="bar"></span>固定端口</h3>
+      <div class="port-row">
+        <span class="p">56700</span>
+        <span class="d"><b>Web 管理面</b><span>仅 127.0.0.1，不随设置放开</span></span>
+      </div>
+      <div class="port-row">
+        <span class="p">56701</span>
+        <span class="d"><b>Mesh（MCP + Peer）</b><span>范围 = mcp_bind_scope ∪ peer_bind_scope</span></span>
+      </div>
+      <div class="port-row">
+        <span class="p">5353</span>
+        <span class="d"><b>mDNS / DNS-SD</b><span>UDP，标准端口，不占用私有端口</span></span>
+      </div>
+      <div class="port-row">
+        <span class="p">56710</span>
+        <span class="d"><b>旧版兼容值</b><span>已不再监听，发现侧归一为 56701</span></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3><span class="bar" style="background:var(--teal)"></span>数据面（不自造协议栈）</h3>
+      <dl class="kv">
+        <dt>SSH</dt><dd>direct-tcpip / forwarded-tcpip，x/crypto/ssh</dd>
+        <dt>SFTP</dt><dd>SSH 会话内，或反向 WS 通道上的 pkg/sftp</dd>
+        <dt>Peer</dt><dd>WS 首帧声明通道：open / exec / pty / fs / relay_open</dd>
+        <dt>HTTP</dt><dd>/proxy/{id}/ 受控反代，默认拒绝公网目标</dd>
+      </dl>
+      <div class="chips" style="margin-top:8px">
+        <span class="chip teal">单跳 Relay</span>
+        <span class="chip teal">NPA 映射 + SSH 映射串联</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3><span class="bar" style="background:var(--violet)"></span>关键设计取舍</h3>
+      <ul class="bullets">
+        <li><b>单进程</b>承载控制面与全部数据面，故障域单一</li>
+        <li><b>反向接入</b>：连接永远由下级发起，上级零入站</li>
+        <li><b>发现 ≠ 信任</b>：mDNS 只提供候选，注册后仍可探测健康</li>
+        <li><b>端口收敛</b>：MCP 与节点通信合并到 56701，按路径分发</li>
+        <li><b>能力分层</b>：MCP 高风险能力独立开关；Web 本地管理不受限</li>
+      </ul>
+    </div>
+
+    <div class="panel">
+      <h3><span class="bar" style="background:var(--amber)"></span>与文档不一致（实现为准）</h3>
+      <ul class="bullets">
+        <li>默认值实际为<b>能力全开</b>、mesh 监听 <b>lan</b>（调试期），与 README「默认只注册 nodes.list / 回环」不符</li>
+        <li>SAD 仍写 MCP 独占 56701、无 peer；实际 56701 与 peer 共用</li>
+        <li>README 称节点页无手工添加入口，但 UI 已有添加表单</li>
+      </ul>
+    </div>
+  </aside>
+</div>
+
+<footer>
+  <span>依据当前工作区源码绘制（未提交状态，最后提交 <span class="mono">4fb5dda</span>）· 21 个 internal 包 · 约 14.5k 行 Go</span>
+  <span class="mono">docs/architecture/npa-architecture.html</span>
+</footer>
+
+
+<style>
+  .docnav{position:fixed;right:14px;top:12px;z-index:99;display:flex;gap:6px;
+    background:#ffffffee;border:1px solid #d9dfe8;border-radius:999px;padding:6px 10px;
+    font-size:11.5px;backdrop-filter:blur(4px);box-shadow:0 4px 14px #0f172a1a}
+  .docnav a{color:#1d4ed8;text-decoration:none;padding:2px 8px;border-radius:999px;white-space:nowrap}
+  .docnav a:hover{background:#ecf1fe}
+  .docnav a.cur{background:#1d4ed8;color:#fff;pointer-events:none}
+  @media print{.docnav{display:none}}
+</style>
+<div class="docnav">
+  <a href="ARCHITECTURE.md" data-page="md">ARCHITECTURE.md</a>
+  <a href="npa-architecture.html" data-page="arch">① 分层总览</a>
+  <a href="npa-mesh.html" data-page="mesh">② 反向接入/数据面</a>
+  <a href="npa-domain-v2.html" data-page="domain">③ 分域 v2 设计</a>
+</div>
+<script>
+  (function(){
+    var page = location.pathname.split('/').pop();
+    document.querySelectorAll('.docnav a').forEach(function(a){
+      if(a.getAttribute('data-page') && page.indexOf(a.getAttribute('data-page'))>=0) a.classList.add('cur');
+    });
+    if(!document.querySelector('.docnav a.cur')){
+      document.querySelector('.docnav a[data-page="md"]').classList.add('cur');
+    }
+  })();
+</script>
+</body>
+</html>

@@ -3,6 +3,7 @@ package peer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -36,6 +37,7 @@ var upgrader = websocket.Upgrader{
 
 type Repository interface {
 	GetNode(id string) (model.Node, error)
+	ListNodes() ([]model.Node, error)
 	SaveNode(node model.Node) error
 	UpdateNodeStatus(id, status, lastError string) error
 }
@@ -49,6 +51,10 @@ type Options struct {
 	AutoTrust func() bool
 	// OnRegister 在节点成功注册后回调（用于审计）。
 	OnRegister func(node model.Node)
+	// Self 提供本机在拓扑中的自我描述（service 注入，hub 不依赖节点表）。
+	Self func() TopologyNode
+	// EphemeralIdle 临时链路的空闲上限（设置项 peer_on_demand_idle）。
+	EphemeralIdle func() time.Duration
 }
 
 // LinkStatus 描述某条反向链路的当前状态。
@@ -66,6 +72,21 @@ type linkState struct {
 	conn     *websocket.Conn
 	lastSeen time.Time
 	registry Registration
+	writeMu  sync.Mutex // 控制帧只有一个写入者：读循环与 require 路径共用
+}
+
+func (l *linkState) send(control Control) error {
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+	return writeJSON(l.conn, control)
+}
+
+// ephemeralState 是按需建立的临时链路（上级之间 / 上级要求下级连过来）。
+// 它不写入节点注册表，空闲超过 TTL 由持有方主动断开。
+type ephemeralState struct {
+	conn     *websocket.Conn
+	backTo   string
+	lastUsed time.Time
 }
 
 // Hub 是上级侧的反向接入服务端：接受注册、维护长连接与空闲连接池，
@@ -74,14 +95,26 @@ type Hub struct {
 	repo Repository
 	opts Options
 
-	mu     sync.Mutex
-	links  map[string]*linkState
-	idle   map[string][]*websocket.Conn
-	closed bool
+	mu    sync.Mutex
+	links map[string]*linkState
+	idle  map[string][]*websocket.Conn
+	// ephemeral：按需建立的临时链路；relayChannels：经持有上级代理时对端推过来的数据通道
+	ephemeral     map[string]*ephemeralState
+	relayChannels map[string][]*websocket.Conn
+	stop          chan struct{}
+	closeOnce     sync.Once
+	closed        bool
 }
 
 func NewHub(repo Repository, opts Options) *Hub {
-	return &Hub{repo: repo, opts: opts, links: map[string]*linkState{}, idle: map[string][]*websocket.Conn{}}
+	return &Hub{
+		repo: repo, opts: opts,
+		links:         map[string]*linkState{},
+		idle:          map[string][]*websocket.Conn{},
+		ephemeral:     map[string]*ephemeralState{},
+		relayChannels: map[string][]*websocket.Conn{},
+		stop:          make(chan struct{}),
+	}
 }
 
 func (h *Hub) info() Info {
@@ -95,14 +128,65 @@ func (h *Hub) info() Info {
 	}
 	return Info{
 		Product: "npa", Name: h.opts.Name, Version: h.opts.Version, PeerPort: port,
-		Subnets: subnets, Protocols: []string{"register", "link", "conn", TypeOpen, TypeExec, TypePTY, TypeFS},
+		Subnets: subnets, Protocols: []string{"register", "link", "conn", TypeOpen, TypeExec, TypePTY, TypeFS, TypeRelayOpen},
 	}
+}
+
+// ResetLinksOnStart 在本机启动（或重启）后调用：
+// 之前标记为 connected 的反向节点此刻必然没有活链路，先置为 offline 等待重连，
+// 避免"显示在线、实际断开"误导用户。
+func (h *Hub) ResetLinksOnStart() int {
+	nodes, err := h.repo.ListNodes()
+	if err != nil {
+		return 0
+	}
+	reset := 0
+	for _, node := range nodes {
+		if node.Protocol != "peer" || node.Status == "offline" {
+			continue
+		}
+		if err := h.repo.UpdateNodeStatus(node.ID, "offline", "本机刚启动，等待节点重新接入"); err == nil {
+			reset++
+		}
+	}
+	return reset
 }
 
 // HandleInfo 返回自描述信息，供下级探测识别 NPA。
 func (h *Hub) HandleInfo(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(h.info())
+}
+
+// HandleTopology 返回"本机 + 其直接下级 + 本机的上级"，供其它上级拼出完整树。
+// 只返回一层 children，递归由请求方按需拉取。
+func (h *Hub) HandleTopology(w http.ResponseWriter, _ *http.Request) {
+	topology := Topology{Children: []TopologyNode{}}
+	if h.opts.Self != nil {
+		topology.Self = h.opts.Self()
+	}
+	h.mu.Lock()
+	online := make(map[string]bool, len(h.links))
+	for id := range h.links {
+		online[id] = true
+	}
+	h.mu.Unlock()
+
+	if nodes, err := h.repo.ListNodes(); err == nil {
+		for _, node := range nodes {
+			if node.Protocol != "peer" || !node.Registered {
+				continue
+			}
+			topology.Children = append(topology.Children, TopologyNode{
+				ID: node.ID, Name: node.Name, Address: node.Address, Port: node.Port,
+				Version: node.Version, Protocol: node.Protocol,
+				Subnets: node.ReachableSubnets,
+				Online:  online[node.ID], Registered: true,
+			})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(topology)
 }
 
 // HandleRegister 处理 HTTP 注册（便于探测与调试；长连接首帧同样可以注册）。
@@ -198,6 +282,20 @@ func (h *Hub) HandleLink(w http.ResponseWriter, r *http.Request) {
 		closeWith("node id mismatch")
 		return
 	}
+	// 按需直连：临时链路不写注册表、不改节点状态，空闲超时后自动断开
+	if registration.Ephemeral {
+		h.setEphemeral(registration.ID, conn, requested)
+		defer h.clearEphemeral(registration.ID, conn)
+		// 必须回执，否则对端会等到超时并退出（链路建了却没有连接池）
+		if err := writeJSON(conn, Control{Type: CtrlRegistered, Node: &registration}); err != nil {
+			return
+		}
+		h.serveControl(conn, registration.ID, true, func(control Control) error {
+			return writeJSON(conn, control)
+		})
+		return
+	}
+
 	node, err := h.Register(registration, remoteIP(r))
 	if err != nil {
 		closeWith(apperrors.MessageOf(err))
@@ -209,8 +307,35 @@ func (h *Hub) HandleLink(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.clearLink(node.ID, conn)
 
-	if err := writeJSON(conn, Control{Type: CtrlRegistered, Node: &registration}); err != nil {
+	// 首帧也必须走发送器：链路已登记，require 路径可能同时在写
+	if err := h.linkSender(node.ID)(Control{Type: CtrlRegistered, Node: &registration}); err != nil {
 		return
+	}
+	h.serveControl(conn, node.ID, false, h.linkSender(node.ID))
+}
+
+// linkSender 返回经互斥保护的控制帧发送器：读循环的 pong 与 require 下发共用，
+// 避免 gorilla 连接被并发写（数据竞争）。
+func (h *Hub) linkSender(nodeID string) func(Control) error {
+	return func(control Control) error {
+		h.mu.Lock()
+		state, ok := h.links[nodeID]
+		h.mu.Unlock()
+		if !ok {
+			return apperrors.New(apperrors.NodeOffline, "反向链路已断开")
+		}
+		return state.send(control)
+	}
+}
+
+// serveControl 处理控制通道：心跳、重新注册，以及下级主动上报的中继失败。
+func (h *Hub) serveControl(conn *websocket.Conn, nodeID string, ephemeral bool, send func(Control) error) {
+	touch := func() {
+		if ephemeral {
+			h.touchEphemeral(nodeID)
+			return
+		}
+		h.touch(nodeID)
 	}
 	for {
 		var control Control
@@ -219,21 +344,33 @@ func (h *Hub) HandleLink(w http.ResponseWriter, r *http.Request) {
 		}
 		switch control.Type {
 		case CtrlPing:
-			h.touch(node.ID)
-			if err := writeJSON(conn, Control{Type: CtrlPong}); err != nil {
+			touch()
+			if err := send(Control{Type: CtrlPong}); err != nil {
 				return
 			}
 		case CtrlRegister:
 			if control.Node != nil {
-				if _, err := h.Register(*control.Node, remoteIP(r)); err != nil {
+				if _, err := h.Register(*control.Node, remoteIP2(conn)); err != nil && !ephemeral {
 					return
 				}
-				h.touch(node.ID)
+				touch()
 			}
+		case CtrlRelayFail:
+			// 下级连不上请求方：保持原样，请求方会按超时转走代理
+			touch()
 		default:
-			h.touch(node.ID)
+			touch()
 		}
 	}
+}
+
+func remoteIP2(conn *websocket.Conn) string {
+	if addr := conn.RemoteAddr(); addr != nil {
+		if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+			return host
+		}
+	}
+	return ""
 }
 
 // HandleConn 处理空闲数据连接：交给连接池，等待上级取用。
@@ -342,7 +479,7 @@ func (h *Hub) take(ctx context.Context, nodeID string, header Header) (*websocke
 		return conn, nil
 	}
 	if lastErr == nil {
-		lastErr = apperrors.New(apperrors.NodeOffline, "peer 没有可用的空闲数据连接（链路未就绪）")
+		lastErr = fmt.Errorf("链路未就绪：节点 %s 当前没有反向连接，请确认该节点的 NPA 正在运行并能访问本机的反向接入端口", nodeID)
 	}
 	return nil, apperrors.Wrap(apperrors.NodeOffline, "cannot take reverse connection", lastErr)
 }
@@ -364,14 +501,6 @@ func (h *Hub) Call(ctx context.Context, nodeID string, header Header) (*websocke
 	return h.take(ctx, nodeID, header)
 }
 
-// Online 报告某条反向链路是否在线。
-func (h *Hub) Online(nodeID string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, ok := h.links[nodeID]
-	return ok
-}
-
 // Links 返回所有在线链路状态（含空闲连接池数量）。
 func (h *Hub) Links() []LinkStatus {
 	h.mu.Lock()
@@ -388,6 +517,7 @@ func (h *Hub) Links() []LinkStatus {
 }
 
 func (h *Hub) Close() {
+	h.closeOnce.Do(func() { close(h.stop) })
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -396,9 +526,23 @@ func (h *Hub) Close() {
 	h.closed = true
 	links := h.links
 	idle := h.idle
+	ephemeral := h.ephemeral
+	relayChannels := h.relayChannels
 	h.links = map[string]*linkState{}
 	h.idle = map[string][]*websocket.Conn{}
+	h.ephemeral = map[string]*ephemeralState{}
+	h.relayChannels = map[string][]*websocket.Conn{}
 	h.mu.Unlock()
+	for _, state := range ephemeral {
+		if state.conn != nil {
+			_ = state.conn.Close()
+		}
+	}
+	for _, channels := range relayChannels {
+		for _, conn := range channels {
+			_ = conn.Close()
+		}
+	}
 	for _, state := range links {
 		if state.conn != nil {
 			_ = state.conn.Close()

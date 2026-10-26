@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/npa/npa/internal/console"
 	"github.com/npa/npa/internal/mcp"
 	"github.com/npa/npa/internal/service"
 	"github.com/npa/npa/internal/state"
@@ -36,26 +37,13 @@ type listenerSupervisor struct {
 	scope   string
 }
 
-func mcpAddress(scope string) string {
+// meshAddress 返回节点通信端口（56701）的监听地址：MCP 与节点间通信（peer）
+// 共用这一个端口，按路径分发。scope 为 lan 时全网卡，否则仅回环。
+func meshAddress(scope string) string {
 	if scope == "lan" {
 		return "0.0.0.0:56701"
 	}
 	return "127.0.0.1:56701"
-}
-
-func peerAddress(settings map[string]string) string {
-	if settings["peer_enabled"] != "true" {
-		return ""
-	}
-	port := settings["peer_port"]
-	if port == "" {
-		port = "56710"
-	}
-	host := "127.0.0.1"
-	if settings["peer_bind_scope"] == "lan" {
-		host = "0.0.0.0"
-	}
-	return net.JoinHostPort(host, port)
 }
 
 func (s *listenerSupervisor) currentScope() string {
@@ -140,35 +128,55 @@ func main() {
 		slog.Error("cannot open state database", "error", err)
 		os.Exit(1)
 	}
+	// 是否隐藏控制台以标记文件为准（与 run.sh / run.bat 的判断完全一致）：
+	// 删掉 <数据目录>/hide_console 就能离线恢复成可见的前台模式，无需改数据库。
+	if _, markerErr := os.Stat(service.HideConsoleMarkerPath(dataDirPath(*dataDir))); markerErr == nil && console.Hide() {
+		slog.Info("控制台已隐藏，输出只写文件；删掉 hide_console 标记即可恢复，或用 Web 设置页的「退出服务」结束进程",
+			"log", filepath.Join(dataDirPath(*dataDir), "npa.log"))
+	}
 	app := service.New(store)
 	mcpManager := mcp.NewManager(app)
 	mcpHTTPHandler := mcpManager.Handler()
-	mcpSupervisor := &listenerSupervisor{name: "MCP", address: mcpAddress, handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if app.Settings()["mcp_enabled"] != "true" {
-			http.Error(w, "MCP service is disabled", http.StatusForbidden)
+	webHandler := web.New(app, mcpManager)
+	peerHandler := webHandler.PeerHandler()
+	// 56701 是节点间通信与 MCP 的公共入口：/mcp 走 MCP，/api/peers/*、/api/info、
+	// /api/topology 走 peer。两个功能各自受自己的开关门控，端口本身按
+	// mcp_bind_scope ∪ peer_bind_scope 取更宽的范围监听。
+	meshSupervisor := &listenerSupervisor{name: "mesh", address: meshAddress, handler: web.RecoverMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" {
+			if app.Settings()["mcp_enabled"] != "true" {
+				http.Error(w, "MCP service is disabled", http.StatusForbidden)
+				return
+			}
+			mcpHTTPHandler.ServeHTTP(w, r)
 			return
 		}
-		mcpHTTPHandler.ServeHTTP(w, r)
-	})}
-	webHandler := web.New(app, mcpManager)
+		// 一次性下载端点：MCP 自升级通道用（token 一次性、5 分钟过期）。
+		// 它必须在 peer 开关门控之外：下载发生在 peer 被关的节点上也该可用。
+		if strings.HasPrefix(r.URL.Path, "/download/") {
+			app.ServeDownload(w, r)
+			return
+		}
+		if app.Settings()["peer_enabled"] != "true" {
+			http.Error(w, "peer service is disabled", http.StatusForbidden)
+			return
+		}
+		peerHandler.ServeHTTP(w, r)
+	}))}
 	webHandler.ShutdownFunc = requestShutdown // Web「退出服务」按钮走这条优雅关闭路径
-	peerSupervisor := &listenerSupervisor{
-		name:    "peer",
-		handler: webHandler.PeerHandler(),
-		address: func(string) string { return peerAddress(app.Settings()) },
-	}
 	app.OnSettingsChanged = func() {
 		mcpManager.Refresh()
-		if err := mcpSupervisor.restart(app.Settings()["mcp_bind_scope"]); err != nil {
-			slog.Error("cannot restart MCP listener", "scope", app.Settings()["mcp_bind_scope"], "error", err)
-		}
-		if err := peerSupervisor.restart(peerScope(app.Settings())); err != nil {
-			slog.Error("cannot restart peer listener", "scope", app.Settings()["peer_bind_scope"], "error", err)
+		if err := meshSupervisor.restart(meshScope(app.Settings())); err != nil {
+			slog.Error("cannot restart mesh listener", "error", err)
 		}
 	}
 	app.ApplyRuntimeSettings(context.Background())
-	if err := peerSupervisor.restart(peerScope(app.Settings())); err != nil {
-		slog.Error("cannot start peer listener", "scope", app.Settings()["peer_bind_scope"], "error", err)
+	if err := meshSupervisor.restart(meshScope(app.Settings())); err != nil {
+		slog.Error("cannot start mesh listener", "error", err)
+	}
+	// 本机重启后旧的反向节点必然没活链路，先置 offline 等它们重新接入
+	if reset := app.Peer.ResetLinksOnStart(); reset > 0 {
+		slog.Info("已把未重连的反向节点标记为离线", "count", reset)
 	}
 	go func() {
 		if err := app.Plugin.Start(context.Background()); err != nil {
@@ -220,17 +228,29 @@ func main() {
 	slog.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = mcpSupervisor.shutdown(ctx)
-	_ = peerSupervisor.shutdown(ctx)
+	_ = meshSupervisor.shutdown(ctx)
 	_ = webServer.Shutdown(ctx)
 	app.Close()
 }
 
-func peerScope(settings map[string]string) string {
-	if settings["peer_enabled"] != "true" {
+// meshScope 是 56701 的监听范围：MCP 与 peer 谁要求更宽就取谁。
+// 两者都关时返回空，监听器整体下线。
+func meshScope(settings map[string]string) string {
+	mcp := settings["mcp_enabled"] == "true"
+	peer := settings["peer_enabled"] == "true"
+	switch {
+	case mcp && peer:
+		if settings["mcp_bind_scope"] == "lan" || settings["peer_bind_scope"] == "lan" {
+			return "lan"
+		}
+		return "local"
+	case mcp:
+		return settings["mcp_bind_scope"]
+	case peer:
+		return settings["peer_bind_scope"]
+	default:
 		return ""
 	}
-	return settings["peer_bind_scope"]
 }
 
 // stopSignal 让 Web「退出服务」与 Ctrl+C 走同一条优雅关闭路径。

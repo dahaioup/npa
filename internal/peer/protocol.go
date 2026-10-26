@@ -13,10 +13,11 @@ import (
 
 // 通道类型：上级从连接池取一条连接后，用首帧（JSON 文本帧）声明要做什么。
 const (
-	TypeOpen = "open" // 反向 TCP（端口映射 / 隧道 / 代理）
-	TypeExec = "exec" // 在下级执行命令
-	TypePTY  = "pty"  // 下级本地交互终端
-	TypeFS   = "fs"   // 标准 SFTP 字节流
+	TypeOpen      = "open"       // 反向 TCP（端口映射 / 隧道 / 代理）
+	TypeExec      = "exec"       // 在下级执行命令
+	TypePTY       = "pty"        // 下级本地交互终端
+	TypeFS        = "fs"         // 标准 SFTP 字节流
+	TypeRelayOpen = "relay_open" // 经持有上级代理到某个下级（A→B→N）
 )
 
 // 控制通道（长连接）帧类型。
@@ -26,6 +27,11 @@ const (
 	CtrlPing       = "ping"
 	CtrlPong       = "pong"
 	CtrlError      = "error"
+	// 跨上级协调
+	CtrlConnectTo    = "connect_to"    // 持有者 → 下级：去连 backto
+	CtrlRelayFail    = "relay_fail"    // 下级 → 持有者：连不上
+	CtrlRequire      = "require"       // 上级 → 持有者：把某下级接到我这里
+	CtrlRequireRelay = "require_relay" // 上级 → 持有者：经你中继到某下级
 )
 
 const (
@@ -35,11 +41,40 @@ const (
 	ackError        byte = 1
 )
 
+// TopologyNode 是拓扑图里的一台 NPA；既能是上级也能是下级。
+type TopologyNode struct {
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Address    string         `json:"address"`
+	Port       int            `json:"port,omitempty"` // mDNS / HTTP api 端口
+	Version    string         `json:"version,omitempty"`
+	Protocol   string         `json:"protocol,omitempty"`
+	Online     bool           `json:"online"`
+	Registered bool           `json:"registered,omitempty"`
+	Children   []TopologyNode `json:"children,omitempty"`
+	// Subnets 是该节点宣告的可达子网，选路时用来判断目标归它
+	Subnets []string `json:"subnets,omitempty"`
+	// Parent / Via / Unknown / Error 由 service 组装跨上级拓扑时填充
+	Parent  string `json:"parent,omitempty"`
+	Via     string `json:"via,omitempty"` // direct | relay:<upper>
+	Unknown bool   `json:"unknown,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// Topology 是一次拓扑查询的返回：自己 + 其直接下级 + 它的上级（可再向上递归）。
+type Topology struct {
+	Self     TopologyNode   `json:"self"`
+	Parent   *TopologyNode  `json:"parent,omitempty"`
+	Children []TopologyNode `json:"children"`
+}
+
 // Header 是每条数据连接的首帧，决定该连接承载哪种通道。
 type Header struct {
-	V         int    `json:"v"`
-	Type      string `json:"type"`
-	Target    string `json:"target,omitempty"`
+	V      int    `json:"v"`
+	Type   string `json:"type"`
+	Target string `json:"target,omitempty"`
+	// NodeID 用于 relay_open：指定要经哪条下级链路转发
+	NodeID    string `json:"node_id,omitempty"`
 	Via       string `json:"via,omitempty"` // direct | ssh:<nodeID>
 	Command   string `json:"command,omitempty"`
 	TimeoutMS int    `json:"timeout_ms,omitempty"`
@@ -59,13 +94,26 @@ type Registration struct {
 	Source  string   `json:"source,omitempty"` // seed | probe | manual
 	// SSHRoutes 是下级已纳管的 SSH 跳板（NPA 节点到 SSH 服务的映射段），供上级计算串联路径。
 	SSHRoutes []model.RemoteRoute `json:"ssh_routes,omitempty"`
+	// Ephemeral 标记这是按需建立的**临时**链路：不写入注册表、不改节点状态、
+	// 空闲超时后由持有方主动断开，节点的持久归属（唯一上级）不受影响。
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
-// Control 是控制通道上的 JSON 帧。
+// Control 是控制通道上的 JSON 帧。除注册/心跳外，还承载跨上级协调消息。
 type Control struct {
 	Type    string        `json:"type"`
 	Node    *Registration `json:"node,omitempty"`
 	Message string        `json:"message,omitempty"`
+	// connect_to：要求下级主动连到 backto（按需直连）
+	Address string `json:"address,omitempty"`
+	// require / require_relay：上级向持有者发起的请求
+	NodeID string `json:"node_id,omitempty"`
+	BackTo string `json:"backto,omitempty"`
+	Via    string `json:"via,omitempty"`
+	// relay_fail：连不上时回报
+	Reason string `json:"reason,omitempty"`
+	// accepted：持有者应答"我已经通知下去了"
+	Accepted bool `json:"accepted,omitempty"`
 }
 
 // ExecFrame 是 exec 通道上的输出帧：先按流回传 stdout/stderr，最后一帧带退出码。

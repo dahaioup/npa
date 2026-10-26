@@ -2,8 +2,11 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -237,5 +240,153 @@ func TestShutdownEndpointWithoutHook(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusOK {
 		t.Fatal("没有关闭钩子时不应返回成功")
+	}
+}
+
+// 节点在线状态：本机恒在线；discovered 节点靠快速端口探测判断，不再永远停在 "discovered"。
+func TestListNodesReportsOnline(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	app := service.New(store)
+	defer app.Close()
+
+	// 在线节点：指向一个真实监听的端口
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	onlinePort, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 离线节点：先占一个端口再放开，确保它此刻没人监听
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := closed.Addr().(*net.TCPAddr).Port
+	_ = closed.Close()
+
+	if err := store.SaveDiscoveredNode(model.Node{
+		ID: "disc-on", Name: "在线节点", Address: host, Port: onlinePort,
+		AuthMethod: "discovered", Protocol: "discovered", Status: "discovered",
+		LastSeen: time.Now().Add(-10 * time.Minute), // 让 mDNS 新鲜度兜底失效，只考验端口探测
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 用 TEST-NET-1 里不可路由的地址，避免探测误中本机自己监听的 56701
+	if err := store.SaveDiscoveredNode(model.Node{
+		ID: "disc-off", Name: "离线节点", Address: "192.0.2.1", Port: closedPort,
+		AuthMethod: "discovered", Protocol: "discovered", Status: "discovered",
+		LastSeen: time.Now().Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := app.ListNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]model.Node{}
+	for _, node := range nodes {
+		found[node.ID] = node
+	}
+	localOnline := false
+	for _, node := range nodes {
+		if node.AuthMethod == "local" {
+			localOnline = node.Online
+		}
+	}
+	if !localOnline {
+		t.Fatal("本机节点必须显示在线")
+	}
+	_ = model.Node{}
+	if !found["disc-on"].Online {
+		t.Fatalf("可达的 discovered 节点应显示在线: %#v", found["disc-on"])
+	}
+	if found["disc-off"].Online {
+		t.Fatalf("不可达的 discovered 节点应显示离线: %#v", found["disc-off"])
+	}
+}
+
+// 树状拓扑：本机 + 其注册的下级（带 parent），跨上级查询失败的分支进 missing。
+func TestTopologyReportsTree(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	app := service.New(store)
+	defer app.Close()
+	if err := store.SaveNode(model.Node{
+		ID: "child-1", Name: "子网节点", Address: "192.168.2.192", Port: 1,
+		Username: "peer", AuthMethod: "peer", Protocol: "peer",
+		Registered: true, Trusted: true, RelayEnabled: true, Version: "0.4.0-phase3",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 不属于本机的节点不应出现在本机的下级里
+	if err := store.SaveNode(model.Node{
+		ID: "ssh-1", Name: "纯 SSH 节点", Address: "192.168.1.9", Port: 22,
+		Username: "dev", AuthMethod: "key", Protocol: "sftp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(New(app, fakeMCP{}).Handler())
+	defer ts.Close()
+	response, err := http.Get(ts.URL + "/api/topology")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		SelfID  string           `json:"self_id"`
+		Nodes   []map[string]any `json:"nodes"`
+		Missing []map[string]any `json:"missing"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.SelfID == "" {
+		t.Fatal("必须返回本机 id")
+	}
+	byID := map[string]map[string]any{}
+	for _, node := range payload.Nodes {
+		byID[fmt.Sprint(node["id"])] = node
+	}
+	if _, ok := byID[payload.SelfID]; !ok {
+		t.Fatalf("拓扑必须包含本机: %#v", payload.Nodes)
+	}
+	child, ok := byID["child-1"]
+	if !ok {
+		t.Fatalf("应包含注册到本机的下级: %#v", payload.Nodes)
+	}
+	if child["parent"] != payload.SelfID {
+		t.Fatalf("下级的 parent 应指向本机: %#v", child)
+	}
+	if child["online"] != true && child["registered"] != true {
+		t.Fatalf("下级应带 registered: %#v", child)
+	}
+	if _, ok := byID["ssh-1"]; ok {
+		t.Fatal("纯 SSH 节点不该出现在拓扑下级里")
 	}
 }

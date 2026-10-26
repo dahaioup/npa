@@ -52,14 +52,17 @@ type Result struct {
 	Restarted  bool   `json:"restarted"` // unix 上 syscall.Exec 不会返回
 }
 
-// binaryName 是本平台二进制在包里的名字。
-func binaryName() string {
-	name := fmt.Sprintf("npa-%s-%s", runtime.GOOS, runtime.GOARCH)
-	if runtime.GOOS == "windows" {
+// BinaryName 是指定平台二进制在包里的名字。
+func BinaryName(goos, goarch string) string {
+	name := fmt.Sprintf("npa-%s-%s", goos, goarch)
+	if goos == "windows" {
 		name += ".exe"
 	}
 	return name
 }
+
+// binaryName 是本平台二进制在包里的名字。
+func binaryName() string { return BinaryName(runtime.GOOS, runtime.GOARCH) }
 
 // IsCandidateArtifact 判断文件名是否是可升级产物。
 // 打包产物形如 npa-all_20261019_2016.zip，单平台二进制形如 npa-darwin-amd64。
@@ -171,7 +174,10 @@ func FileSHA256(path string) (string, error) {
 }
 
 // VerifyArtifact 校验本平台二进制：体积下限 + 可执行魔数，挡住截断或错文件。
-func VerifyArtifact(path string) error {
+func VerifyArtifact(path string) error { return VerifyArtifactFor(path, runtime.GOOS) }
+
+// VerifyArtifactFor 校验指定平台的二进制（推送升级到别的平台节点时用）。
+func VerifyArtifactFor(path, goos string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -188,7 +194,7 @@ func VerifyArtifact(path string) error {
 	if _, err := io.ReadFull(file, head); err != nil {
 		return err
 	}
-	switch runtime.GOOS {
+	switch goos {
 	case "windows":
 		if head[0] != 'M' || head[1] != 'Z' {
 			return fmt.Errorf("不是 Windows 可执行文件（缺少 MZ 魔数）")
@@ -209,8 +215,13 @@ func VerifyArtifact(path string) error {
 }
 
 // Extract 从 zip 里取出本平台二进制；传进来的是裸二进制则原样返回。
-// 返回的路径在 dir 下，已具备可执行权限（unix）。
 func Extract(archivePath, dir string) (string, error) {
+	return ExtractPlatform(archivePath, dir, runtime.GOOS, runtime.GOARCH)
+}
+
+// ExtractPlatform 从 zip 里取出**指定平台**的二进制（推送升级到别的平台节点时用）。
+// 返回的路径在 dir 下，已具备可执行权限（unix）。
+func ExtractPlatform(archivePath, dir, goos, goarch string) (string, error) {
 	if !strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
 		return archivePath, nil
 	}
@@ -220,7 +231,7 @@ func Extract(archivePath, dir string) (string, error) {
 	}
 	defer reader.Close()
 
-	name := binaryName()
+	name := BinaryName(goos, goarch)
 	var target *zip.File
 	for i := range reader.File {
 		entry := reader.File[i]

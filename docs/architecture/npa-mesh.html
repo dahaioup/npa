@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NPA 反向接入与数据面</title>
+<style>
+  :root{
+    --ink:#0f172a; --muted:#5b6779; --faint:#8a94a6; --line:#d9dfe8; --line2:#e8edf3;
+    --bg:#f2f5f9; --card:#ffffff;
+    --blue:#1d4ed8; --blue-soft:#ecf1fe;
+    --teal:#0f766e; --teal-soft:#e6f5f3;
+    --violet:#6d28d9; --violet-soft:#f2ecfe;
+    --amber:#b45309; --amber-soft:#fdf4e5;
+    --slate:#334155; --slate-soft:#eef2f7;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink)}
+  body{font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;
+       font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;width:1680px;padding:34px 40px 28px;
+       display:flex;flex-direction:column;gap:16px}
+  code,.mono{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:11px}
+  h1,h2,h3,h4,p{margin:0}
+
+  header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding:0 2px 2px}
+  h1{font-size:27px;font-weight:700;letter-spacing:.4px}
+  header p{color:var(--muted);font-size:12.5px;margin-top:5px}
+  .legend{display:flex;gap:16px;align-items:center;font-size:11.5px;color:var(--muted)}
+  .legend i{display:inline-block;width:26px;height:0;border-top:2px solid var(--blue);vertical-align:middle;margin-right:6px}
+  .legend .dash{border-top:2px dashed var(--violet)}
+  .legend .teal{border-top:2px solid var(--teal)}
+  .legend b{color:var(--ink);font-weight:600}
+
+  .canvas{position:relative;width:1600px;height:418px}
+
+  .node{position:absolute;top:0;width:600px;height:372px;border-radius:16px;background:#fff;
+        border:1px solid var(--line);box-shadow:0 2px 10px #0f172a0a;overflow:hidden;display:flex;flex-direction:column}
+  .node.a{left:0}
+  .node.b{left:1000px}
+  .nhead{padding:14px 18px 12px;color:#fff;display:flex;align-items:center;gap:10px;position:relative}
+  .node.a .nhead{background:linear-gradient(135deg,#1e3a8a,#1d4ed8)}
+  .node.b .nhead{background:linear-gradient(135deg,#0f4f4a,#0f766e)}
+  .nhead .role{font-size:9.5px;letter-spacing:1.4px;opacity:.75;font-weight:600}
+  .nhead h2{font-size:17px;font-weight:700;letter-spacing:.5px}
+  .nhead h2 span{font-size:12px;font-weight:500;opacity:.85;margin-left:6px}
+  .nhead .tagl{margin-left:auto;font-size:10.5px;background:#ffffff22;border:1px solid #ffffff33;border-radius:999px;padding:3px 9px}
+  .nbody{padding:14px 18px;display:flex;flex-direction:column;gap:10px;flex:1}
+  .sub{border:1px solid var(--line2);border-radius:10px;padding:9px 11px;background:#fcfdff}
+  .sub h4{font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px;margin-bottom:4px}
+  .sub h4 .mono{font-weight:400;color:var(--faint);font-size:9.5px}
+  .sub p{font-size:11px;color:var(--muted);line-height:1.6}
+  .sub ul{margin:3px 0 0;padding-left:13px;font-size:11px;line-height:1.65;color:#3f4b5e}
+  .sub li::marker{color:#a9b6c8}
+  .sub li b{color:var(--ink);font-weight:600}
+  .sub.hi{background:var(--blue-soft);border-color:#c9d8fb}
+  .sub.hi h4{color:var(--blue)}
+  .node.b .sub.hi{background:var(--teal-soft);border-color:#bfe3de}
+  .node.b .sub.hi h4{color:var(--teal)}
+  .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+  .chip{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--slate-soft);color:var(--slate);white-space:nowrap}
+  .chip.blue{background:var(--blue-soft);color:var(--blue)}
+  .chip.teal{background:var(--teal-soft);color:var(--teal)}
+  .chip.violet{background:var(--violet-soft);color:var(--violet)}
+  .chip.amber{background:var(--amber-soft);color:var(--amber)}
+
+  .nofoot{position:absolute;top:384px;width:600px;font-size:11px;color:var(--muted);display:flex;gap:6px;align-items:flex-start}
+  .nofoot.a{left:0}
+  .nofoot.b{left:1000px}
+  .nofoot em{font-style:normal;color:var(--amber);font-weight:600}
+
+  /* ---------- lanes ---------- */
+  .lane{position:absolute;left:600px;width:400px}
+  .lane .lbl{font-size:10.5px;line-height:1.45;color:#3f4b5e;text-align:center;padding:0 6px}
+  .lane .lbl b{font-weight:600;color:var(--ink)}
+  .lane .lbl .mono{font-size:9.5px;color:var(--faint)}
+  .track{position:relative;height:2px;margin-top:8px}
+  .track .line{position:absolute;inset:0;background:var(--blue)}
+  .track.dash .line{background:repeating-linear-gradient(90deg,var(--violet) 0 7px,transparent 7px 14px)}
+  .track.teal .line{background:var(--teal)}
+  .track .head{position:absolute;top:-5px;width:0;height:0;border-style:solid}
+  .track .head.l{border-width:6px 9px 6px 0;border-color:transparent var(--blue) transparent transparent;left:-1px}
+  .track .head.r{border-width:6px 0 6px 9px;border-color:transparent transparent transparent var(--blue);right:-1px}
+  .track.dash .head.l{border-color:transparent var(--violet) transparent transparent}
+  .track.dash .head.r{border-color:transparent transparent transparent var(--violet)}
+  .track.teal .head.l{border-color:transparent var(--teal) transparent transparent}
+  .track.teal .head.r{border-color:transparent transparent transparent var(--teal)}
+
+  /* ---------- cross-upper ---------- */
+  .band{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px 18px 18px;position:relative}
+  .band>h3{font-size:13px;font-weight:600;color:var(--slate);display:flex;align-items:center;gap:8px;margin-bottom:4px}
+  .band>h3 .bar{width:3px;height:13px;border-radius:2px;background:var(--amber)}
+  .band>p.lead{font-size:11px;color:var(--muted);margin:0 0 14px 11px}
+
+  .chain{display:grid;grid-template-columns:1fr 250px 1fr 250px 1fr;align-items:center;gap:0}
+  .hop{text-align:center;position:relative;padding:0 6px}
+  .hop .box{border:1px solid var(--line);border-radius:11px;padding:10px 12px;background:#fbfcfe}
+  .hop .box b{display:block;font-size:13px}
+  .hop .box span{font-size:10.5px;color:var(--muted)}
+  .hop.mid .box{background:var(--teal-soft);border-color:#bfe3de}
+  .hop.mid .box b{color:var(--teal)}
+  .arrow{padding:0 8px;position:relative;text-align:center}
+  .arrow .ln{position:relative;height:2px;background:var(--teal);margin:18px 0 6px}
+  .arrow .ln:before,.arrow .ln:after{content:"";position:absolute;top:-5px;border-style:solid;width:0;height:0}
+  .arrow .ln:before{left:-1px;border-width:6px 9px 6px 0;border-color:transparent var(--teal) transparent transparent}
+  .arrow .ln:after{right:-1px;border-width:6px 0 6px 9px;border-color:transparent transparent transparent var(--teal)}
+  .arrow .cap{font-size:10px;color:var(--muted);line-height:1.4}
+  .arrow .cap b{display:block;color:var(--teal);font-weight:600;font-size:10.5px}
+  .wslabel{position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:9.5px;color:var(--faint);
+           background:#fff;padding:0 5px;white-space:nowrap}
+
+  /* ---------- stepper ---------- */
+  .steps{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;position:relative}
+  .step{background:#fff;border:1px solid var(--line);border-radius:12px;padding:11px 12px;position:relative}
+  .step:after{content:"";position:absolute;right:-14px;top:50%;transform:translateY(-50%);width:0;height:0;
+              border-width:5px 0 5px 8px;border-style:solid;border-color:transparent transparent transparent #b9c4d4}
+  .step:last-child:after{display:none}
+  .step .n{font-family:"SF Mono",Menlo,monospace;font-size:9.5px;color:var(--blue);font-weight:600;letter-spacing:.5px}
+  .step h4{font-size:12px;font-weight:600;margin:3px 0 3px}
+  .step p{font-size:10.5px;color:var(--muted);line-height:1.55}
+  .step .mono{font-size:9.5px;color:var(--faint)}
+  .step.warn{background:var(--amber-soft);border-color:#f3ddb5}
+  .step.warn .n{color:var(--amber)}
+
+  footer{margin-top:2px;display:flex;justify-content:space-between;color:var(--faint);font-size:10.5px}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>反向接入与数据面</h1>
+    <p>下级节点主动出站建立并维持较长的 WebSocket 连接，上级不需要任何入站端口；SSH、文件、终端、TCP 全部复用这条连接</p>
+  </div>
+  <div class="legend">
+    <span><i></i><b>注册</b></span>
+    <span><i class="dash"></i><b>控制帧</b></span>
+    <span><i class="teal"></i><b>数据面</b></span>
+  </div>
+</header>
+
+<div class="canvas">
+
+  <!-- ===================== 上级节点 A ===================== -->
+  <div class="node a">
+    <div class="nhead">
+      <div>
+        <div class="role">UPPER · 发起方</div>
+        <h2>A <span>上级节点</span></h2>
+      </div>
+      <span class="tagl">无公网 IP 也能被管理</span>
+    </div>
+    <div class="nbody">
+      <div class="sub">
+        <h4>调用来源</h4>
+        <div class="chips">
+          <span class="chip blue">MCP 客户端 · 21 个工具</span>
+          <span class="chip">Web UI</span>
+          <span class="chip">Port Mapping 监听 127.0.0.1</span>
+          <span class="chip">Relay 单跳中转</span>
+        </div>
+      </div>
+      <div class="sub hi">
+        <h4>Peer Hub <span class="mono">internal/peer/hub.go</span></h4>
+        <ul>
+          <li>链接表 + <b>空闲连接池</b>（peer_pool_size=4）</li>
+          <li><b>Dial / Call / OpenPTY / FS</b>：挑一条链路写控制帧</li>
+          <li>跨上级 <b>require / require_relay</b>，逐跳代理</li>
+        </ul>
+      </div>
+      <div class="sub">
+        <h4>Mesh 入口 <span class="mono">:56701（复用）</span></h4>
+        <p><span class="mono">/api/info</span> · <span class="mono">/api/peers/register</span> · <span class="mono">/api/peers/link</span> · <span class="mono">/api/peers/conn</span></p>
+      </div>
+    </div>
+  </div>
+  <div class="nofoot a"><em>入站</em>只为接受「下级主动发起的注册」与「复用连接的转发」，不监听任何被管端口。</div>
+
+  <!-- ===================== 下级节点 B ===================== -->
+  <div class="node b">
+    <div class="nhead">
+      <div>
+        <div class="role">LOWER · 被管方</div>
+        <h2>B <span>下级节点</span></h2>
+      </div>
+      <span class="tagl">NAT / 防火墙后</span>
+    </div>
+    <div class="nbody">
+      <div class="sub hi">
+        <h4>Peer Agent <span class="mono">internal/peer/agent.go</span></h4>
+        <ul>
+          <li><b>发现</b>：种子 peer_seeds / mDNS / 显式网段探测</li>
+          <li><b>校验</b>：GET <span class="mono">/api/info</span> 确认是 NPA 且 ID 未被占用</li>
+          <li><b>维持</b>：心跳 + 指数退避重连 + 空闲池补足</li>
+        </ul>
+      </div>
+      <div class="sub">
+        <h4>执行面</h4>
+        <ul>
+          <li><b>exec</b>：非交互命令，capture stdout/stderr</li>
+          <li><b>pty</b>：交互终端（x/crypto/ssh）</li>
+          <li><b>fs</b>：SFTP over WS（pkg/sftp 走管道，不起 sshd）</li>
+          <li><b>open</b>：任意 TCP（SSH / HTTP / 数据库）</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="nofoot b"><em>出站</em>只发起出站连接；即使主机在 NAT 后、没有端口映射，也能被上级调用。</div>
+
+  <!-- ===================== lanes ===================== -->
+  <div class="lane" style="top:92px">
+    <div class="lbl"><b>① 发现与注册（B 发起）</b><br><span class="mono">GET /api/info → POST /api/peers/register → WS /api/peers/link</span></div>
+    <div class="track"><span class="head l"></span><span class="line"></span></div>
+  </div>
+
+  <div class="lane" style="top:192px">
+    <div class="lbl"><b>② 控制长连接（双向）</b><br>心跳 ping / pong · 控制帧 <span class="mono">{type: exec | pty | fs}</span></div>
+    <div class="track dash"><span class="head l"></span><span class="line"></span><span class="head r"></span></div>
+  </div>
+
+  <div class="lane" style="top:292px">
+    <div class="lbl"><b>③ 数据面（复用同一条连接）</b><br>反向 TCP <span class="mono">{type: open}</span> · 中继 <span class="mono">{type: relay_open}</span> · 双向字节流</div>
+    <div class="track teal"><span class="head l"></span><span class="line"></span><span class="head r"></span></div>
+  </div>
+</div>
+
+<!-- ===================== 跨上级 ===================== -->
+<div class="band">
+  <h3><span class="bar"></span>跨上级：目标在两跳之外时，仍然逐跳走已有反向链路</h3>
+  <p class="lead">A 只认识 B；B 同时是 N 的上级。A 需要访问 N 时，A 请 B 去要一条到 N 的转发。</p>
+  <div class="chain">
+    <div class="hop">
+      <div class="box"><b>节点 A</b><span>发起 /api/peers/require</span></div>
+    </div>
+    <div class="arrow">
+      <span class="wslabel">WS「A 出站」</span>
+      <div class="ln"></div>
+      <div class="cap"><b>require → require_relay</b>A 请求 B 提供到目标 N 的通道</div>
+    </div>
+    <div class="hop mid">
+      <div class="box"><b>节点 B</b><span>既是 A 的下级，又是 N 的上级</span></div>
+    </div>
+    <div class="arrow">
+      <span class="wslabel">WS「N 出站」</span>
+      <div class="ln"></div>
+      <div class="cap"><b>relay_open</b>B 向 N 要一条反向 TCP，串起 A↔N</div>
+    </div>
+    <div class="hop">
+      <div class="box"><b>节点 N</b><span>目标服务所在机器</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== stepper ===================== -->
+<div>
+  <h3 style="font-size:12.5px;font-weight:600;color:var(--slate);margin-bottom:9px">
+    <span style="display:inline-block;width:3px;height:12px;background:var(--blue);border-radius:2px;margin-right:8px;vertical-align:-1px"></span>
+    一次 <span class="mono" style="background:var(--slate-soft);padding:2px 6px;border-radius:4px">ssh.exec</span> 实际经过的六步
+  </h3>
+  <div class="steps">
+    <div class="step">
+      <div class="n">STEP 01</div><h4>MCP 调用</h4>
+      <p>Streamable HTTP 到 <span class="mono">/mcp</span>，上下文打上 <span class="mono">SourceMCP</span>。</p>
+    </div>
+    <div class="step warn">
+      <div class="n">STEP 02</div><h4>策略与限流</h4>
+      <p>关闭 <b>SSH 能力</b>时在此直接拒绝；固定窗口计数超限即失败。</p>
+    </div>
+    <div class="step">
+      <div class="n">STEP 03</div><h4>寻址</h4>
+      <p>同一台机器 → 本地；SSH 节点 → 直连；peer 节点 → 走链路。</p>
+    </div>
+    <div class="step">
+      <div class="n">STEP 04</div><h4>取链路</h4>
+      <p>Hub 从空闲池挑一条；没有则临时拨号或向上级 require。</p>
+    </div>
+    <div class="step">
+      <div class="n">STEP 05</div><h4>执行</h4>
+      <p>写一帧 <span class="mono">{type:"exec"}</span>；B 跑完把 stdout / 退出码回传。</p>
+    </div>
+    <div class="step">
+      <div class="n">STEP 06</div><h4>审计</h4>
+      <p><span class="mono">audit.Record</span> 统一脱敏，成功与失败都留痕。</p>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <span>数据面不自造协议栈：SSH 用 direct-tcpip / forwarded-tcpip，文件用 SFTP，HTTP 走 <span class="mono">/proxy/{id}/</span></span>
+  <span class="mono">docs/architecture/npa-mesh.html</span>
+</footer>
+
+
+<style>
+  .docnav{position:fixed;right:14px;top:12px;z-index:99;display:flex;gap:6px;
+    background:#ffffffee;border:1px solid #d9dfe8;border-radius:999px;padding:6px 10px;
+    font-size:11.5px;backdrop-filter:blur(4px);box-shadow:0 4px 14px #0f172a1a}
+  .docnav a{color:#1d4ed8;text-decoration:none;padding:2px 8px;border-radius:999px;white-space:nowrap}
+  .docnav a:hover{background:#ecf1fe}
+  .docnav a.cur{background:#1d4ed8;color:#fff;pointer-events:none}
+  @media print{.docnav{display:none}}
+</style>
+<div class="docnav">
+  <a href="ARCHITECTURE.md" data-page="md">ARCHITECTURE.md</a>
+  <a href="npa-architecture.html" data-page="arch">① 分层总览</a>
+  <a href="npa-mesh.html" data-page="mesh">② 反向接入/数据面</a>
+  <a href="npa-domain-v2.html" data-page="domain">③ 分域 v2 设计</a>
+</div>
+<script>
+  (function(){
+    var page = location.pathname.split('/').pop();
+    document.querySelectorAll('.docnav a').forEach(function(a){
+      if(a.getAttribute('data-page') && page.indexOf(a.getAttribute('data-page'))>=0) a.classList.add('cur');
+    });
+    if(!document.querySelector('.docnav a.cur')){
+      document.querySelector('.docnav a[data-page="md"]').classList.add('cur');
+    }
+  })();
+</script>
+</body>
+</html>

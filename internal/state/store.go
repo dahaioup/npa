@@ -151,7 +151,7 @@ func defaults() map[string]string {
 		"restore_port_mappings": "true",
 		"peer_enabled":          "true",
 		"peer_bind_scope":       "lan",
-		"peer_port":             "56710",
+		"peer_port":             "56701",
 		"peer_seeds":            "",
 		"peer_probe_subnets":    "",
 		"peer_pool_size":        "4",
@@ -159,6 +159,11 @@ func defaults() map[string]string {
 		"autostart":             "false",
 		"hide_console":          "false",
 		"update_artifact":       "",
+		"push_package":          "",
+		"peer_uppers":           "",
+		"peer_advertise":        "",
+		"peer_on_demand_idle":   "60",
+		"peer_relay_fallback":   "true",
 	}
 }
 

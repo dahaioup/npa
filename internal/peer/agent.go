@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -60,10 +61,13 @@ type Agent struct {
 	// active 是当前主链路；Stop 时必须主动关闭它，
 	// 否则阻塞在读控制帧上的 goroutine 不会因 ctx 取消而退出。
 	active *websocket.Conn
+	// dialRequests 是"上级要求本机连过去"的派发队列：读循环只投递地址（值拷贝），
+	// 由 Start 起的长生命周期消费者处理，避免 go 语句按引用捕获局部变量产生竞态。
+	dialRequests chan string
 }
 
 func NewAgent(opts AgentOptions) *Agent {
-	return &Agent{opts: opts}
+	return &Agent{opts: opts, dialRequests: make(chan string, 8)}
 }
 
 func (a *Agent) call(fn func() string, fallback string) string {
@@ -122,6 +126,23 @@ func (a *Agent) Start(parent context.Context) {
 	a.cancel = cancel
 	a.mu.Unlock()
 	go a.loop(ctx)
+	go a.consumeDialRequests(ctx)
+}
+
+// consumeDialRequests 处理"按需直连"派发。
+// 本 goroutine 会等子任务全部结束才返回，避免它们读到已释放的栈槽。
+func (a *Agent) consumeDialRequests(ctx context.Context) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case address := <-a.dialRequests:
+			wg.Add(1)
+			go func(addr string) { defer wg.Done(); a.connectEphemeral(addr) }(address)
+		}
+	}
 }
 
 func (a *Agent) Stop() {
@@ -177,6 +198,16 @@ func (a *Agent) loop(ctx context.Context) {
 		case err != nil:
 			a.record(err)
 		case len(candidates) == 0:
+			// 既没配种子也没配探测网段：本机多半只是在当"上级"运行，
+			// 这不是错误，不记录、不打日志，只保持中性状态。
+			if strings.TrimSpace(a.seeds()) == "" && strings.TrimSpace(a.probeSubnets()) == "" {
+				a.set(func(s *Status) { s.LastError = "" })
+				if !sleep(ctx, 5*time.Second) {
+					return
+				}
+				continue
+			}
+			// 配置了却找不到，才是需要暴露的问题
 			a.record(fmt.Errorf("没有可用的上级节点：请填写 peer_seeds（ip:port）或 peer_probe_subnets"))
 			if !sleep(ctx, 5*time.Second) {
 				return
@@ -192,6 +223,58 @@ func (a *Agent) loop(ctx context.Context) {
 			return
 		}
 		backoff = nextBackoff(backoff)
+	}
+}
+
+// controlSession 把控制通道的长寿命资源放在堆上，并保证**所有子任务在会话关闭前结束**。
+// 否则后台 goroutine 会读到已返回函数的栈槽（go 语句按引用捕获局部变量），产生数据竞争。
+type controlSession struct {
+	conn       *websocket.Conn
+	done       chan struct{}
+	pool       *sync.WaitGroup
+	wg         sync.WaitGroup
+	address    string
+	cancelPool context.CancelFunc
+}
+
+func newControlSession(conn *websocket.Conn, address string) *controlSession {
+	return &controlSession{
+		conn: conn, done: make(chan struct{}), pool: &sync.WaitGroup{}, address: address,
+	}
+}
+
+// startPool 记录连接池维护所需的取消函数；goroutine 必须在**调用方**里启动并挂到 wg 上，
+// 因为 go 语句按引用捕获局部变量，短命的辅助函数返回后子任务会读到已释放的栈槽。
+func (c *controlSession) withPool(ctx context.Context) context.Context {
+	poolCtx, cancel := context.WithCancel(ctx)
+	c.cancelPool = cancel
+	return poolCtx
+}
+
+// stop 关闭会话并**等待全部子任务退出**，之后才允许调用方返回（栈安全 + 干净关停）。
+func (c *controlSession) stop() {
+	close(c.done)
+	if c.cancelPool != nil {
+		c.cancelPool()
+	}
+	c.wg.Wait()
+	c.pool.Wait()
+}
+
+// heartbeat 在控制通道上定期发 ping，直到 done 关闭或写失败。
+// 参数按值传递，避免闭包捕获局部变量带来的竞态。
+func heartbeat(conn *websocket.Conn, done <-chan struct{}) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := writeJSON(conn, Control{Type: CtrlPing}); err != nil {
+				return
+			}
+		}
 	}
 }
 
@@ -268,32 +351,13 @@ func (a *Agent) serve(ctx context.Context, candidate Candidate) error {
 		s.LastError = ""
 	})
 
-	poolCtx, stopPool := context.WithCancel(ctx)
-	var pool sync.WaitGroup
-	go a.maintainPool(poolCtx, &pool, candidate.Address) // 必须异步，否则控制帧循环无法启动
-	defer func() {
-		stopPool()
-		pool.Wait()
-	}()
-
-	heartbeatDone := make(chan struct{})
-	defer close(heartbeatDone)
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-heartbeatDone:
-				return
-			case <-ticker.C:
-				if err := writeJSON(conn, Control{Type: CtrlPing}); err != nil {
-					return
-				}
-			}
-		}
-	}()
+	session := newControlSession(conn, candidate.Address)
+	defer session.stop()
+	poolCtx := session.withPool(ctx)
+	session.wg.Add(1)
+	go func() { defer session.wg.Done(); a.maintainPool(poolCtx, session.pool, session.address) }()
+	session.wg.Add(1)
+	go func() { defer session.wg.Done(); heartbeat(session.conn, session.done) }()
 
 	for {
 		var control Control
@@ -303,6 +367,17 @@ func (a *Agent) serve(ctx context.Context, candidate Candidate) error {
 		switch control.Type {
 		case CtrlPong, CtrlRegistered:
 			continue
+		case CtrlConnectTo:
+			// 持有者要求本机主动连到另一个上级（按需直连）。
+			// 只把地址投进队列，不在这里起 goroutine：go 语句按引用捕获局部变量，
+			// 而本函数随后就返回，会与仍在运行的 goroutine 产生数据竞争。
+			if target := strings.TrimSpace(control.Address); target != "" {
+				select {
+				case a.dialRequests <- target:
+				default:
+					slog.Debug("按需直连队列已满，忽略该请求", "address", target)
+				}
+			}
 		case CtrlError:
 			return fmt.Errorf("peer hub error: %s", control.Message)
 		}
@@ -389,8 +464,61 @@ func (a *Agent) openIdle(ctx context.Context, base string, add func(int)) {
 	a.serveChannel(ctx, conn, header)
 }
 
+// connectEphemeral 按上级要求临时连到另一个上级：它只是一条临时链路，
+// 不改本机的主上级归属（Primary 不变），由对方在空闲超时后主动断开。
+func (a *Agent) connectEphemeral(address string) {
+	endpoint := "ws://" + address + "/api/peers/link?node=" + url.QueryEscape(a.call(a.opts.NodeID, "peer"))
+	conn, _, err := websocket.DefaultDialer.DialContext(context.Background(), endpoint, nil)
+	if err != nil {
+		slog.Warn("按需连到上级失败", "address", address, "error", err)
+		return
+	}
+	defer conn.Close()
+
+	registration := a.registration("on-demand")
+	registration.Ephemeral = true
+	if err := writeJSON(conn, Control{Type: CtrlRegister, Node: &registration}); err != nil {
+		return
+	}
+	var ack Control
+	if err := readJSON(conn, &ack, time.Now().Add(10*time.Second)); err != nil {
+		slog.Warn("按需直连未被接受", "address", address, "error", err)
+		return
+	}
+	if ack.Type != CtrlRegistered {
+		slog.Warn("按需直连被拒绝", "address", address, "reply", ack.Type, "message", ack.Message)
+		return
+	}
+	slog.Info("已按需连到上级", "address", address)
+
+	// 临时会话期间维持心跳与数据连接池；对方空闲超时后会关闭，这里随之退出
+	session := newControlSession(conn, address)
+	defer session.stop()
+	poolCtx := session.withPool(context.Background())
+	session.wg.Add(1)
+	go func() { defer session.wg.Done(); a.maintainPool(poolCtx, session.pool, session.address) }()
+	session.wg.Add(1)
+	go func() { defer session.wg.Done(); heartbeat(session.conn, session.done) }()
+	for {
+		var control Control
+		if err := readJSON(conn, &control, time.Now().Add(linkTimeout)); err != nil {
+			return // 对方断开：临时会话结束
+		}
+		if control.Type == CtrlError {
+			return
+		}
+	}
+}
+
 func (a *Agent) serveChannel(ctx context.Context, conn *websocket.Conn, header Header) {
 	defer conn.Close()
+	defer func() {
+		// 单条通道的 panic 只断这条连接，不能带崩整个 agent。
+		if rec := recover(); rec != nil {
+			slog.Error("peer channel panic", "type", header.Type, "panic", rec, "stack", string(debug.Stack()))
+			_ = writeAck(conn, fmt.Errorf("channel panic: %v", rec))
+		}
+	}()
 	switch header.Type {
 	case TypeOpen:
 		a.serveOpen(ctx, conn, header)

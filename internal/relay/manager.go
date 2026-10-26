@@ -34,11 +34,24 @@ type PeerDialer interface {
 	Online(nodeID string) bool
 }
 
+// UpperCoordinator 由 service 注入，负责"目标节点不在本机时，去拓扑里找持有它的上级"。
+type UpperCoordinator interface {
+	// HolderForTarget 返回持有该目标的上级地址与节点 id
+	HolderForTarget(ctx context.Context, target string) (holderAddress, nodeID string, ok bool)
+	// EnsureDirect 让持有者通知该节点主动连到本机（按需直连）
+	EnsureDirect(ctx context.Context, holderAddress, nodeID string) error
+	// DialViaUpper 经持有上级代理拨号（A→B→N）
+	DialViaUpper(ctx context.Context, holderAddress, nodeID, target, via string) (net.Conn, error)
+	// RelayFallbackEnabled 是否允许走"经上级代理"这条兜底
+	RelayFallbackEnabled() bool
+}
+
 type Manager struct {
-	repo Repository
-	ssh  *sshx.Manager
-	peer PeerDialer
-	mu   sync.Mutex
+	repo  Repository
+	ssh   *sshx.Manager
+	peer  PeerDialer
+	upper UpperCoordinator
+	mu    sync.Mutex
 }
 
 func NewManager(repo Repository, sshManager *sshx.Manager) *Manager {
@@ -56,6 +69,19 @@ func (m *Manager) peerDialer() PeerDialer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.peer
+}
+
+// SetUpperCoordinator 注入跨上级协调能力（拓扑找持有者、按需直连、经上级代理）。
+func (m *Manager) SetUpperCoordinator(coordinator UpperCoordinator) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.upper = coordinator
+}
+
+func (m *Manager) upperCoordinator() UpperCoordinator {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.upper
 }
 
 func targetAddress(target string) (string, int, error) {
@@ -187,7 +213,20 @@ func (m *Manager) Select(ctx context.Context, target string) (model.RelayRoute, 
 			}
 		}
 	}
-	// 4) 兜底：私网目标但没有宣告匹配的子网，交给在线 peer 试拨（可达性以实际拨号为准）
+	// 4) 本机不持有该节点，但拓扑显示某个上级持有它：
+	//    先让持有者通知节点主动连过来（按需直连），连不上就走"经上级代理"兜底
+	if coordinator := m.upperCoordinator(); coordinator != nil {
+		if holder, nodeID, ok := coordinator.HolderForTarget(ctx, target); ok {
+			if err := coordinator.EnsureDirect(ctx, holder, nodeID); err == nil {
+				// 节点已连到本机：它会进本机 peer 的连接池，走常规反向链路
+				return route(ip.String()+"/32", nodeID, nodeID), nil
+			}
+			if coordinator.RelayFallbackEnabled() {
+				return route(ip.String()+"/32", "upper-relay:"+holder, nodeID), nil
+			}
+		}
+	}
+	// 5) 兜底：私网目标但没有宣告匹配的子网，交给在线 peer 试拨（可达性以实际拨号为准）
 	if ip.IsPrivate() {
 		for _, node := range peerNodes {
 			return route(ip.String()+"/32", node.ID, node.ID), nil
@@ -223,6 +262,14 @@ func (m *Manager) dialHops(ctx context.Context, route model.RelayRoute, target s
 	if len(route.Hops) == 0 {
 		return nil, apperrors.New(apperrors.TargetForbidden, ErrNoRoute.Error())
 	}
+	// 经持有上级代理：A → B → N
+	if strings.HasPrefix(route.ViaNodeID, "upper-relay:") {
+		coordinator := m.upperCoordinator()
+		if coordinator == nil {
+			return nil, apperrors.New(apperrors.NotSupported, "跨上级代理未启用")
+		}
+		return coordinator.DialViaUpper(ctx, strings.TrimPrefix(route.ViaNodeID, "upper-relay:"), route.Hops[0], target, "")
+	}
 	entry := route.Hops[0]
 	if !m.isPeerNode(entry) {
 		return m.dialNode(ctx, entry, target)
@@ -239,11 +286,12 @@ func (m *Manager) dialHops(ctx context.Context, route model.RelayRoute, target s
 }
 
 func (m *Manager) isPeerNode(nodeID string) bool {
-	node, err := m.repo.GetNode(nodeID)
-	if err != nil {
-		return false
+	if node, err := m.repo.GetNode(nodeID); err == nil && node.Protocol == "peer" {
+		return true
 	}
-	return node.Protocol == "peer"
+	// 本机没有该节点的记录，但它已按需连过来（临时链路）——同样走反向数据面
+	dialer := m.peerDialer()
+	return dialer != nil && dialer.Online(nodeID)
 }
 
 // DialNode 经指定节点转发到目标：peer 节点走反向链路，其余走 SSH direct-tcpip。

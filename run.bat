@@ -39,7 +39,10 @@ set LOG=%DATA_DIR%\npa.log
 
 if exist "%MARKER%" (
   if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
-  start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath '%BIN%' -ArgumentList '%*'"
+  rem start /min: launches NPA with its own console, decoupled from this one
+  rem (closing this window does not kill NPA). NPA then hides that window
+  rem itself when the hide_console setting is on.
+  start "" /min "%BIN%" %*
   echo NPA started in background; you can close this console.
   echo Log: %LOG%
   echo Web: http://127.0.0.1:56700

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,38 @@ type Manager struct {
 	status  string
 	lastErr string
 	localID string
+	// peerPort / children 用于 mDNS TXT（role、children、peer），由 service 注入
+	peerPort func() int
+	children func() int
+}
+
+// SetLocalInfo 注入本机的反向接入端口与已注册下级数量，用于广播 role/children/peer。
+func (m *Manager) SetLocalInfo(peerPort func() int, children func() int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerPort, m.children = peerPort, children
+}
+
+func (m *Manager) localPeerPort() int {
+	m.mu.Lock()
+	fn := m.peerPort
+	m.mu.Unlock()
+	if fn != nil {
+		if port := fn(); port > 0 {
+			return port
+		}
+	}
+	return 56701
+}
+
+func (m *Manager) localChildren() int {
+	m.mu.Lock()
+	fn := m.children
+	m.mu.Unlock()
+	if fn == nil {
+		return 0
+	}
+	return fn()
 }
 
 func NewManager(repo Repository, version string) *Manager {
@@ -129,12 +162,21 @@ func LocalSubnets() []string {
 	return subnets
 }
 
-func (m *Manager) txtRecord(nodeID, name string, subnets []string, capabilities []string) []string {
+// txtRecord 广播本机信息；role=upper / children=N 让同网段的其它 NPA 一眼看出谁是"上级"，
+// 从而去它那里查拓扑；peer= 是反向接入端口，跨上级查询要用。
+func (m *Manager) txtRecord(nodeID, name string, subnets []string, capabilities []string, peerPort, children int) []string {
+	role := "node"
+	if children > 0 {
+		role = "upper"
+	}
 	return []string{
 		"id=" + nodeID,
 		"name=" + name,
 		"ver=" + strings.TrimPrefix(m.version, "v"),
 		"api=56700",
+		"peer=" + strconv.Itoa(peerPort),
+		"role=" + role,
+		"children=" + strconv.Itoa(children),
 		"caps=" + strings.Join(capabilities, ","),
 		"subnets=" + strings.Join(subnets, ","),
 	}
@@ -202,7 +244,7 @@ func (m *Manager) start(ctx context.Context) error {
 	}
 	instance := "NPA-" + host
 	m.localID = model.NodeIDFromMAC()
-	server, err := zeroconf.Register(instance, serviceType, "local.", 56700, m.txtRecord(m.localID, host, LocalSubnets(), []string{"ssh", "file", "tunnel", "screenshot", "mouse", "discovery", "relay"}), nil)
+	server, err := zeroconf.Register(instance, serviceType, "local.", 56700, m.txtRecord(m.localID, host, LocalSubnets(), []string{"ssh", "file", "tunnel", "screenshot", "mouse", "discovery", "relay"}, m.localPeerPort(), m.localChildren()), nil)
 	if err != nil {
 		m.mu.Lock()
 		m.status, m.lastErr = "failed", err.Error()
@@ -323,6 +365,7 @@ func (m *Manager) resolveWithDnsSD(ctx context.Context, instance string) {
 		AuthMethod: "discovered", Protocol: "discovered", Status: "discovered",
 		Capabilities: splitCSV(values["caps"]), ReachableSubnets: splitCSV(values["subnets"]),
 		Version:    strings.TrimSpace(values["ver"]),
+		PeerPort:   atoiOr(values["peer"], 0),
 		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	if node.Name == "" {
@@ -388,12 +431,31 @@ func parseEntry(entry *zeroconf.ServiceEntry) (model.Node, bool) {
 	}
 	capabilities := splitCSV(values["caps"])
 	subnets := splitCSV(values["subnets"])
+	peerPort := atoiOr(values["peer"], 0)
 	return model.Node{
 		ID: id, DisplayID: values["id"], Name: name, Address: address, Port: entry.Port, Username: "", AuthMethod: "discovered",
 		Protocol: "discovered", Status: "discovered", Capabilities: capabilities, ReachableSubnets: subnets,
-		Version:    strings.TrimSpace(values["ver"]),
+		Version: strings.TrimSpace(values["ver"]),
+		// 旧版本节点在 mDNS TXT 里广播的是 56710：端口收敛后指向同一个服务
+		PeerPort:   normalizeLegacyPort(peerPort),
 		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}, true
+}
+
+func atoiOr(value string, fallback int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+// normalizeLegacyPort 把端口收敛前的 56710 归一为 56701。
+func normalizeLegacyPort(port int) int {
+	if port == 56710 {
+		return 56701
+	}
+	return port
 }
 
 func splitCSV(value string) []string {
@@ -422,6 +484,39 @@ func (m *Manager) Refresh(ctx context.Context) error {
 
 func (m *Manager) Nodes() ([]model.Node, error) {
 	return m.repo.ListDiscoveredNodes()
+}
+
+// StaleAfter 是发现节点的清理阈值：离线（超过该时长没有再收到它的广播）就从列表移除。
+const StaleAfter = 6 * time.Hour
+
+// pruneInterval 是后台清理的扫描间隔。
+const pruneInterval = 30 * time.Minute
+
+// PruneStale 清理过期的已发现节点，返回清理数量。
+// 只处理 mDNS 发现的节点；手工添加与反向接入（peer）的节点不会被自动删除。
+func (m *Manager) PruneStale(now time.Time) (int, error) {
+	nodes, err := m.repo.ListDiscoveredNodes()
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, node := range nodes {
+		seen := node.LastSeen
+		if seen.IsZero() {
+			seen = node.UpdatedAt
+		}
+		// "超过 6 小时" 是严格大于：正好 6 小时仍保留
+		if seen.IsZero() || now.Sub(seen) <= StaleAfter {
+			continue
+		}
+		if err := m.repo.DeleteDiscoveredNode(node.ID); err != nil {
+			continue
+		}
+		removed++
+		slog.Info("清理离线超过 6 小时的发现节点",
+			"id", node.ID, "name", node.Name, "last_seen", seen.Format(time.RFC3339))
+	}
+	return removed, nil
 }
 
 func (m *Manager) Status() (string, string) {

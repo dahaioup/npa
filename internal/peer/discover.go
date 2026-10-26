@@ -24,8 +24,34 @@ type Candidate struct {
 
 func (c Candidate) Endpoint() string { return c.Address }
 
-// DefaultPort 是 peer 接口的默认端口（与 state.defaults 的 peer_port 保持一致）。
-const DefaultPort = 56710
+// DefaultPort 是节点通信端口的默认值：注册、控制长连接、数据池、
+// 协调 RPC 与 MCP 共用 56701（与 state.defaults、cmd/npa/main.go 保持一致）。
+const DefaultPort = 56701
+
+// LegacyPort 是端口收敛前专用的反向接入端口。旧版本节点自报的地址与
+// 用户种子里写死的 :56710 一律视为指向 56701（两端口在新版是同一个服务）。
+const LegacyPort = 56710
+
+// NormalizePort 把历史遗留的 56710 归一为 56701；其余原样返回。
+func NormalizePort(port int) int {
+	if port == LegacyPort {
+		return DefaultPort
+	}
+	return port
+}
+
+// NormalizeAddress 对 host:port 做同样的端口归一；解析失败原样返回。
+func NormalizeAddress(address string) string {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return address
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return address
+	}
+	return net.JoinHostPort(host, strconv.Itoa(NormalizePort(port)))
+}
 
 // ParseSeeds 解析逗号/空白分隔的种子地址，缺端口时补默认端口。
 func ParseSeeds(raw string, port int) []string {

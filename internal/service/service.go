@@ -1,11 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -35,7 +38,12 @@ import (
 	"github.com/pkg/sftp"
 )
 
-const Version = "0.4.0-phase3"
+const Version = "0.4.1-phase3"
+
+// meshPort 是节点间通信的固定端口：注册、控制长连接、数据池、协调 RPC
+// 与 MCP 共用 56701。节点通信端口不再可配（peer_port 设置项已废弃，
+// 旧库残留值一律忽略），见 cmd/npa/main.go 的 meshSupervisor。
+const meshPort = 56701
 
 type Service struct {
 	Store             *state.Store
@@ -52,6 +60,10 @@ type Service struct {
 	PeerAgent         *peer.Agent
 	resourceDir       string
 	started           time.Time
+	stop              chan struct{}
+	stopOnce          sync.Once
+	topologyCache     *topologyCacheEntry
+	downloadTokens    map[string]downloadToken
 	mu                sync.RWMutex
 	limiter           map[string]*rateWindow
 	OnSettingsChanged func()
@@ -69,7 +81,8 @@ func New(store *state.Store) *Service {
 	resourceDir, _ := os.MkdirTemp("", "npa-resources-*")
 	app := &Service{
 		Store: store, SSH: sshManager, Files: fileService, Tunnels: tunnelManager,
-		Audit: audit.New(store), started: time.Now(), limiter: map[string]*rateWindow{}, resourceDir: resourceDir,
+		Audit: audit.New(store), started: time.Now(), limiter: map[string]*rateWindow{},
+		resourceDir: resourceDir, stop: make(chan struct{}),
 	}
 	app.Plugin = plugin.NewManager(filepath.Join("plugins", "desktop"))
 	app.Desktop = desktop.NewRouterWithRoot(app.Plugin, resourceDir)
@@ -84,9 +97,52 @@ func New(store *state.Store) *Service {
 	fileService.PeerFS = func(ctx context.Context, nodeID string) (*sftp.Client, func(), error) {
 		return app.Peer.FS(ctx, nodeID)
 	}
+	// HTTP 文件面：peer 节点可直连时大文件不走 SFTP-over-WS 通道。
+	fileService.PeerHTTPBase = func(nodeID string) string {
+		node, err := app.Store.GetNode(nodeID)
+		if err != nil || node.Protocol != "peer" || strings.TrimSpace(node.Address) == "" {
+			return ""
+		}
+		return "http://" + net.JoinHostPort(node.Address, strconv.Itoa(peer.DefaultPort))
+	}
+	// 跨域兜底：经持有上级代理拨到节点自己的 mesh 端口，HTTP 文件面照样可用。
+	fileService.RelayDial = func(ctx context.Context, id string) (net.Conn, error) {
+		return app.dialNodeMesh(ctx, id)
+	}
 	app.PortMappings.TargetValidator = app.validateTarget
 	app.wirePeer()
+	app.startDiscoveryJanitor()
 	return app
+}
+
+// startDiscoveryJanitor 启动时清理一次，之后每 30 分钟扫一次：
+// 离线超过 6 小时的 mDNS 发现节点会被移除（避免同一台机器换网卡后留下重复的陈旧记录）。
+func (s *Service) startDiscoveryJanitor() {
+	s.PruneDiscovered()
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ticker.C:
+				s.PruneDiscovered()
+			}
+		}
+	}()
+}
+
+// PruneDiscovered 清理离线超过 6 小时的发现节点，返回清理数量。
+func (s *Service) PruneDiscovered() int {
+	if s.Discovery == nil {
+		return 0
+	}
+	removed, err := s.Discovery.PruneStale(time.Now())
+	if err != nil {
+		slog.Warn("prune discovered nodes failed", "error", err)
+	}
+	return removed
 }
 
 // wirePeer 构造反向接入的上级 Hub 与下级 Agent；闭包在运行期读取设置，保证热生效。
@@ -111,18 +167,21 @@ func (s *Service) wirePeer() {
 		}
 	}
 	s.Peer = peer.NewHub(s.Store, peer.Options{
-		Version: Version,
-		Name:    hostname,
-		Port: func() int {
-			return intSetting(s.Settings()["peer_port"], peer.DefaultPort)
-		},
+		Version:   Version,
+		Name:      hostname,
+		Port:      func() int { return meshPort },
 		Subnets:   discovery.LocalSubnets,
 		AutoTrust: func() bool { return parseBool(s.Settings()["peer_auto_trust"]) },
+		EphemeralIdle: func() time.Duration {
+			return time.Duration(intSetting(s.Settings()["peer_on_demand_idle"], 60)) * time.Second
+		},
 		OnRegister: func(node model.Node) {
 			s.Audit.Record(context.Background(), "peer.register", node.ID, policy.CapBase,
 				audit.SafeParameters(map[string]string{"address": node.Address, "source": node.PeerSource, "subnets": strings.Join(node.ReachableSubnets, ",")}),
 				time.Now(), nil)
 		},
+		// 跨上级查拓扑时，别人问"你是谁、你下面有谁"
+		Self: func() peer.TopologyNode { return s.topologySelf() },
 	})
 	s.PeerAgent = peer.NewAgent(peer.AgentOptions{
 		Version: Version,
@@ -140,8 +199,19 @@ func (s *Service) wirePeer() {
 		SSHRoutes:    s.sshRouteHints,
 		OnError:      logPeerError,
 	})
-	// relay 通过 peer 数据面访问反向接入的节点
+	// relay 通过 peer 数据面访问反向接入的节点；跨上级协调由 service 自己实现
 	s.Relay.SetPeerDialer(s.Peer)
+	s.Relay.SetUpperCoordinator(s)
+	s.Peer.StartSweeper() // 临时链路空闲回收（peer_on_demand_idle）
+	// mDNS 广播 role/children/peer，便于同网段的其它上级发现我们并查询拓扑
+	if s.Discovery != nil {
+		s.Discovery.SetLocalInfo(func() int {
+			if s.Settings()["peer_enabled"] != "true" {
+				return 0
+			}
+			return meshPort
+		}, func() int { return len(s.registeredChildren()) })
+	}
 }
 
 // sshRouteHints 把本机已授权的 SSH 跳板上报给上级，
@@ -168,13 +238,38 @@ func (s *Service) sshRouteHints() []model.RemoteRoute {
 }
 
 // DialNode 是统一的目标拨号入口：peer 节点走反向链路，SSH 节点走 direct-tcpip。
+// 直连失败且允许回退时，经持有上级代理（A→B→N）兜底——跨域隧道/映射因此可用。
 // 端口映射、隧道、Web 代理共用它，从而对上层透明。
 func (s *Service) DialNode(ctx context.Context, nodeID, target string) (net.Conn, error) {
 	if isLocalNodeID(nodeID) {
 		return nil, apperrors.New(apperrors.NotSupported, "本地节点不需要拨号")
 	}
 	conn, _, err := s.Relay.DialNode(ctx, nodeID, target)
-	return conn, err
+	if err == nil {
+		return conn, nil
+	}
+	if conn2, relayErr := s.dialNodeViaUpper(ctx, nodeID, target); relayErr == nil {
+		return conn2, nil
+	}
+	return nil, err
+}
+
+// dialNodeViaUpper 是跨域兜底：按节点 ID 找到持有它的上级，请它代理转发。
+func (s *Service) dialNodeViaUpper(ctx context.Context, nodeID, target string) (net.Conn, error) {
+	if !s.RelayFallbackEnabled() {
+		return nil, apperrors.New(apperrors.NodeOffline, "跨上级代理回退未启用（peer_relay_fallback）")
+	}
+	holder, ok := s.HolderForNode(ctx, nodeID)
+	if !ok {
+		return nil, apperrors.New(apperrors.NodeOffline, "拓扑里找不到该节点的持有上级")
+	}
+	return s.DialViaUpper(ctx, holder, nodeID, target, "")
+}
+
+// dialNodeMesh 经反向链路或跨上级代理拨到节点自己的 mesh 端口（127.0.0.1:56701）。
+// 拿到的是节点 HTTP 文件面/exec 端口的原始 TCP 连接。
+func (s *Service) dialNodeMesh(ctx context.Context, nodeID string) (net.Conn, error) {
+	return s.DialNode(ctx, nodeID, net.JoinHostPort("127.0.0.1", strconv.Itoa(meshPort)))
 }
 
 func intSetting(raw string, fallback int) int {
@@ -186,12 +281,68 @@ func intSetting(raw string, fallback int) int {
 }
 
 // isPeerNode 判断目标是否为反向接入节点（连接由它主动建立）。
+// 主表没有时再查完整拓扑：跨域节点（挂在别的上级下）只出现在拓扑里，
+// 它们同样走 peer 通道（直连失败自动经持有上级代理）。
 func (s *Service) isPeerNode(nodeID string) bool {
-	node, err := s.Store.GetNode(nodeID)
+	if node, err := s.Store.GetNode(nodeID); err == nil {
+		return node.Protocol == "peer"
+	}
+	payload, err := s.Topology(context.Background())
 	if err != nil {
 		return false
 	}
-	return node.Protocol == "peer"
+	nodes, ok := payload["nodes"].([]peer.TopologyNode)
+	if !ok {
+		return false
+	}
+	for _, node := range nodes {
+		if node.ID == nodeID && node.Protocol == "peer" {
+			return true
+		}
+	}
+	return false
+}
+
+// execViaNodeMesh 在跨域节点的 mesh 端口上执行命令：拨到 127.0.0.1:56701 后
+// POST /api/exec（节点 HTTP 面，与文件传输同一条代理通道）。
+func (s *Service) execViaNodeMesh(ctx context.Context, nodeID, command string, timeout time.Duration) (model.ExecResult, error) {
+	result := model.ExecResult{}
+	conn, err := s.dialNodeMesh(ctx, nodeID)
+	if err != nil {
+		return result, err
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			MaxConnsPerHost:   1,
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return conn, nil
+			},
+		},
+	}
+	defer client.CloseIdleConnections()
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout+15*time.Second)
+	defer cancel()
+	payload, _ := json.Marshal(map[string]any{"command": command, "timeout_ms": timeout.Milliseconds()})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://mesh/api/exec", bytes.NewReader(payload))
+	if err != nil {
+		return result, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return result, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+		return result, apperrors.New(apperrors.NodeOffline, "node exec endpoint: "+string(body))
+	}
+	err = json.NewDecoder(response.Body).Decode(&result)
+	return result, err
 }
 
 // peerDial 实现「NPA 映射 + SSH 映射」的分段拨号：direct 由 NPA 自己转发，
@@ -234,12 +385,13 @@ func (s *Service) PeerStatus() map[string]any {
 	status := map[string]any{
 		"enabled":       parseBool(settings["peer_enabled"]),
 		"bind_scope":    settings["peer_bind_scope"],
-		"port":          intSetting(settings["peer_port"], peer.DefaultPort),
+		"port":          meshPort,
 		"seeds":         settings["peer_seeds"],
 		"probe_subnets": settings["peer_probe_subnets"],
 		"pool_size":     intSetting(settings["peer_pool_size"], 4),
 		"auto_trust":    parseBool(settings["peer_auto_trust"]),
 		"address":       discovery.PrimaryIP(),
+		"advertise":     strings.TrimSpace(s.Settings()["peer_advertise"]),
 		"agent":         s.PeerAgent.Status(),
 		"links":         s.Peer.Links(),
 		"local_subnets": discovery.LocalSubnets(),
@@ -262,6 +414,7 @@ func (s *Service) RefreshPeer(ctx context.Context) error {
 }
 
 func (s *Service) Close() {
+	s.stopOnce.Do(func() { close(s.stop) })
 	if s.PeerAgent != nil {
 		s.PeerAgent.Stop()
 	}
@@ -350,9 +503,12 @@ func (s *Service) SaveSettings(values map[string]string) error {
 	return nil
 }
 
-// HideConsoleMarker 是 run.sh / run.bat 读取的标记文件：
-// 存在 → 后台异步启动、输出只进日志；不存在 → 前台阻塞、控制台与日志双输出。
-func (s *Service) HideConsoleMarker() string { return filepath.Join(s.Store.DataDir(), "hide_console") }
+// HideConsoleMarkerPath 是 run.sh / run.bat 与 Go 侧共同依据的标记文件：
+// 存在 → 后台/隐藏模式；删除 → 立刻回到前台可见模式（不依赖数据库，便于离线恢复）。
+func HideConsoleMarkerPath(dataDir string) string { return filepath.Join(dataDir, "hide_console") }
+
+// HideConsoleMarker 是当前实例的隐藏控制台标记位置。
+func (s *Service) HideConsoleMarker() string { return HideConsoleMarkerPath(s.Store.DataDir()) }
 
 // LogFilePath 是日志文件位置，前台与后台模式都会写。
 func (s *Service) LogFilePath() string { return filepath.Join(s.Store.DataDir(), "npa.log") }
@@ -499,14 +655,83 @@ func (s *Service) ListNodes() ([]model.Node, error) {
 		result = append(result, candidate)
 		known[candidate.ID] = struct{}{}
 	}
-	// 对端自报版本比本机新时标记出来，Web 与 MCP 都能看到
 	for i := range result {
 		if isLocalNodeID(result[i].ID) {
+			result[i].Online = true
 			continue
 		}
+		result[i].Online = s.probeNode(result[i])
+		// 对端自报版本比本机新时标记出来，Web 与 MCP 都能看到
 		result[i].UpdateAvailable = version.IsNewer(result[i].Version, Version)
 	}
 	return result, nil
+}
+
+type nodeHealth struct {
+	online    bool
+	checkedAt time.Time
+}
+
+const (
+	healthProbeTimeout = 600 * time.Millisecond
+	healthCacheTTL     = 5 * time.Second
+	// mDNS 广播新鲜度兜底：探测不到端口但广播还在，说明进程活着
+	discoveredFreshWindow = 3 * time.Minute
+)
+
+var healthCache sync.Map // nodeID -> nodeHealth
+
+// probeNode 判断节点是否在线：
+//   - peer 节点看反向链路（权威，无需探测）
+//   - 其余节点并发探测它可能监听的端口（SSH 端口、peer 端口、MCP 端口），结果缓存 5s
+//   - mDNS 发现的节点在广播新鲜时也视为在线（Web 默认只监听回环，端口探测可能失败）
+func (s *Service) probeNode(node model.Node) bool {
+	if node.Protocol == "peer" {
+		return s.Peer != nil && s.Peer.Online(node.ID)
+	}
+	if cached, ok := healthCache.Load(node.ID); ok {
+		if entry, valid := cached.(nodeHealth); valid && time.Since(entry.checkedAt) < healthCacheTTL {
+			return entry.online
+		}
+	}
+	online := s.tcpProbe(node)
+	if !online && node.Discovered && !node.LastSeen.IsZero() && time.Since(node.LastSeen) < discoveredFreshWindow {
+		online = true
+	}
+	healthCache.Store(node.ID, nodeHealth{online: online, checkedAt: time.Now()})
+	return online
+}
+
+// tcpProbe 并发探测该节点可能监听的端口，任一可达即认为在线。
+func (s *Service) tcpProbe(node model.Node) bool {
+	ports := map[int]struct{}{}
+	if node.Port > 0 {
+		ports[node.Port] = struct{}{}
+	}
+	ports[meshPort] = struct{}{}
+
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		reach bool
+	)
+	for port := range ports {
+		port := port
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(node.Address, strconv.Itoa(port)), healthProbeTimeout)
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+			mu.Lock()
+			reach = true
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return reach
 }
 
 func (s *Service) GetNode(id string) (model.Node, error) {
@@ -581,6 +806,15 @@ func (s *Service) Exec(ctx context.Context, nodeID, command string, timeout time
 	started := time.Now()
 	if s.isPeerNode(nodeID) {
 		result, err := s.Peer.Exec(ctx, nodeID, command, timeout)
+		if err == nil {
+			s.Audit.Record(ctx, "peer.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command}), started, nil)
+			return result, nil
+		}
+		// 跨域节点不在本机链路上：经持有上级代理拨它的 mesh 端口走 HTTP exec。
+		if relayResult, relayErr := s.execViaNodeMesh(ctx, nodeID, command, timeout); relayErr == nil {
+			s.Audit.Record(ctx, "peer.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command, "via": "upper-relay"}), started, nil)
+			return relayResult, nil
+		}
 		s.Audit.Record(ctx, "peer.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command}), started, err)
 		return result, err
 	}
@@ -1134,7 +1368,7 @@ func (s *Service) Overview() model.Overview {
 	tunnels, _ := s.Tunnels.List()
 	connected := 0
 	for _, node := range nodes {
-		if node.Status == "connected" {
+		if node.Online {
 			connected++
 		}
 	}

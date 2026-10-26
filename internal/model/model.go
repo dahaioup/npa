@@ -28,6 +28,10 @@ type Node struct {
 	PeerRoutes []RemoteRoute `json:"peer_routes,omitempty"`
 	// Version 是对端自报的 NPA 版本（peer 注册、mDNS TXT 的 ver）；纯 SSH 节点通常为空。
 	Version string `json:"version,omitempty"`
+	// PeerPort 是对端广播的反向接入端口（跨上级查拓扑要用）。
+	PeerPort int `json:"peer_port,omitempty"`
+	// Online 由 ListNodes 计算：peer 看反向链路是否在线，其余节点做快速探测。
+	Online bool `json:"online"`
 	// UpdateAvailable 由 ListNodes 计算：该节点版本严格新于本机。
 	UpdateAvailable bool      `json:"update_available,omitempty"`
 	LastSeen        time.Time `json:"last_seen,omitempty"`

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"runtime/debug"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -125,6 +126,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/shutdown", s.handleShutdown)
 	mux.HandleFunc("POST /api/update/check", s.handleUpdateCheck)
 	mux.HandleFunc("POST /api/update/apply", s.handleUpdateApply)
+	mux.HandleFunc("POST /api/update/push", s.handleUpdatePush)
 	mux.HandleFunc("GET /api/mcp", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.mcp.Status()) })
 	mux.HandleFunc("GET /api/discovery", s.handleDiscoveryNodes)
 	mux.HandleFunc("POST /api/discovery/refresh", s.handleDiscoveryRefresh)
@@ -137,7 +139,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /proxy/{id}/", s.handleProxy)
 	mux.HandleFunc("GET /api/nodes/{id}/pty", s.handlePTY)
 	mux.HandleFunc("/", s.handleStatic)
-	return securityHeaders(mux)
+	return securityHeaders(RecoverMiddleware(mux))
 }
 
 // peerRoutes 注册反向接入相关路由；同时挂到回环 Web 与独立的 peer 端口上。
@@ -149,13 +151,31 @@ func (s *Server) peerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/peers", s.handlePeerStatus)
 	mux.HandleFunc("PUT /api/peers", s.handlePeerSettings)
 	mux.HandleFunc("POST /api/peers/discover", s.handlePeerDiscover)
+	mux.HandleFunc("GET /api/topology", s.handleTopology)
+	mux.HandleFunc("POST /api/peers/require", s.app.Peer.HandleRequire)
+	mux.HandleFunc("POST /api/peers/require_relay", s.app.Peer.HandleRequireRelay)
+	mux.HandleFunc("GET /api/peers/relay", s.app.Peer.HandleRelay)
+	peer.NewFileAPI().Register(mux)
+}
+
+// RecoverMiddleware 兜底任意 handler 的 panic，避免单请求打崩整个进程。
+func RecoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("http handler panic", "path", r.URL.Path, "panic", rec, "stack", string(debug.Stack()))
+				http.Error(w, "internal panic", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // PeerHandler 是 peer 端口专用的处理器：只暴露反向接入入口，不含 Web 管理面。
 func (s *Server) PeerHandler() http.Handler {
 	mux := http.NewServeMux()
 	s.peerRoutes(mux)
-	return securityHeaders(mux)
+	return securityHeaders(RecoverMiddleware(mux))
 }
 
 func remoteHost(r *http.Request) string {
@@ -180,6 +200,16 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"registered": true, "id": node.ID})
 }
 
+// handleTopology 返回完整树状拓扑（本机 + 下级 + 上级链 + 其它上级的下级）。
+func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
+	payload, err := s.app.Topology(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, payload)
+}
+
 func (s *Server) handlePeerStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, s.app.PeerStatus())
 }
@@ -195,16 +225,16 @@ func (s *Server) handlePeerSettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, apperrors.New(apperrors.InvalidArgument, "仅允许修改 peer_* 设置: "+key))
 			return
 		}
+		if key == "peer_port" {
+			// 节点通信端口已固定为 56701（与 MCP 共用），设置项废弃
+			writeError(w, apperrors.New(apperrors.InvalidArgument,
+				"节点通信端口已固定为 56701（与 MCP 服务共用），peer_port 设置已废弃"))
+			return
+		}
 		switch key {
 		case "peer_probe_subnets":
 			if _, err := peer.ParseProbeSubnets(value); err != nil {
 				writeError(w, apperrors.Wrap(apperrors.InvalidArgument, "invalid probe subnets", err))
-				return
-			}
-		case "peer_port":
-			port, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil || port < 1 || port > 65535 {
-				writeError(w, apperrors.New(apperrors.InvalidArgument, "peer_port 必须在 1-65535 之间"))
 				return
 			}
 		case "peer_pool_size":
@@ -616,6 +646,40 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.ShutdownFunc != nil {
 			s.ShutdownFunc()
+		}
+	}()
+}
+
+// handleUpdatePush 把本机的新版本推给节点：默认只上传，restart=true 时再让节点自我替换重启。
+// 替换会中断节点与本机的连接，因此上传先回响应，替换放到异步执行。
+func (s *Server) handleUpdatePush(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		NodeID    string `json:"node_id"`
+		RemoteDir string `json:"remote_dir"`
+		Restart   bool   `json:"restart"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if strings.TrimSpace(request.NodeID) == "" {
+		writeError(w, apperrors.New(apperrors.InvalidArgument, "必须指定目标节点"))
+		return
+	}
+	report, err := s.app.PushPackage(policy.WithSource(r.Context(), policy.SourceWeb), request.NodeID, request.RemoteDir)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, report)
+	if !request.Restart {
+		return
+	}
+	nodeID := request.NodeID
+	go func() {
+		time.Sleep(300 * time.Millisecond) // 先让响应发出去
+		if _, err := s.app.PushRestart(context.Background(), nodeID, report); err != nil {
+			slog.Error("push restart failed", "node", nodeID, "error", err)
 		}
 	}()
 }
