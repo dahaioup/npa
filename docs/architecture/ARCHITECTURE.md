@@ -75,6 +75,7 @@ sequenceDiagram
 - **数据面不自造协议栈**：SSH 用 `direct-tcpip` / `forwarded-tcpip`，文件用 SFTP（SSH 会话内，或 WS 通道上的 `pkg/sftp` 管道），HTTP 走 `/proxy/{id}/`。
 - **跨上级**：A 只认识 B，B 同时是 N 的上级；A 通过 `require → require_relay` 让 B 向 N 要一条 `relay_open`，逐跳串起 A↔N，拓扑深度上限 4。
 - **文件/执行面（HTTP，优先）**：peer 节点在 56701 上暴露 `/api/file/*`（list/stat/read/download/upload/write/mkdir/remove/rename，流式）与 `POST /api/exec`。上级对 peer 的文件操作（含升级包推送）与 exec **优先走这两个端点**，SFTP-over-WS 与 TypeExec 通道降级为回退——大文件不再挤占通道池（exec/PTY/隧道饿死的根因）。
+- **设计决策（2026-10-26）：放弃直连协商**——跨域访问一律走代理链（require 协商反向管道 + relay_open 串接）。代理已全流式、延迟与带宽在局域网规模下不构成瓶颈，直连协商的协议复杂度（地址通告、协商竞态、双链路活性）不划算；出现持续大流量或跨公网链路时再重评。
 - **跨域兜底**：目标节点挂在别的上级下时，`DialNode` 直连失败自动按节点 ID 在拓扑里找到持有上级，经 A→B→N 代理拨到**节点自己的 56701**，文件/exec 照常可用（需 `peer_relay_fallback=true`；中间持有者地址不通时在其上设 `peer_advertise`）。隧道/端口映射/Web 代理共用该入口，跨域 RustDesk 场景因此可用。端到端验证：`TestCrossUpperPushAndTunnel`。
 
 ## 5. MCP 与权限

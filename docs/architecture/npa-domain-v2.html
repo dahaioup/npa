@@ -209,10 +209,10 @@
 
   <div class="lanebox tealbox">
     <h3><span class="bar"></span>批量文件面（新增）<span class="mono" style="font-weight:400;color:var(--faint)">file.go · 上传 / 下载 / 升级包</span></h3>
-    <p class="lead">大文件专用路径，两档按可达性自动选择，与通道池完全隔离。</p>
+    <p class="lead">大文件专用路径，与通道池完全隔离；跨域一律走代理链上的 HTTP，不设直连协商档。</p>
     <table class="spec">
       <tr><th>档位</th><th>机制</th></tr>
-      <tr><td><b>A · 直连 HTTP</b><br>同 / 可达网段（最常见）</td><td>上级签发一次性 <span class="mono">/api/file/{token}</span>（5min、用后即焚，语义同现有 <span class="mono">/download/{token}</span>）→ 节点 56701 纯 HTTP 传输。Range 续传、分块 SHA256、吞吐即 HTTP 吞吐。</td></tr>
+      <tr><td><b>A · 直连 HTTP</b><br>同域 / 持有者代理链（一律 HTTP）</td><td>上级签发一次性 <span class="mono">/api/file/{token}</span>（5min、用后即焚，语义同现有 <span class="mono">/download/{token}</span>）→ 节点 56701 纯 HTTP 传输。Range 续传、分块 SHA256、吞吐即 HTTP 吞吐。</td></tr>
       <tr><td><b>B · 反向 bulk 通道</b><br>不可直连（NAT 后）</td><td>反向链路上新增 <span class="mono">TypeBulk</span>：<b>不占池</b>，按需临时拨出站连接，传完即关；块大小 1MB + 逐块校验 + 断点续传。</td></tr>
       <tr><td><b>升级包推送</b>（现走 SFTP-over-WS，十几 MB 塞通道 → 推送失败主因）</td><td>改走文件面 A/B；落地后复用现有一次性 <span class="mono">/download/{token}</span> + 自升级脚本；重启前 drain：停接新会话，在途调用结束后再替换二进制。</td></tr>
       <tr><td><b>限额与公平</b></td><td>每节点并发 bulk ≤2、全局限速（设置项）、审计记录字节数；防止 bulk 反过来挤占上行带宽影响控制面。</td></tr>
@@ -243,7 +243,7 @@
     <div class="stack">
       <div class="lay"><b>push 为主</b>：状态一变，delta 推给所有邻域管理者（O(域数) 条消息，非 20s 轮询）</div>
       <div class="lay">pull 兜底：新邻域出现 / seq 断档 / 连接重建 → 全量快照</div>
-      <div class="lay">跨域访问复用现有原语：<b>require</b>（通知对方直连）→ 不通则 <b>relay_open</b>（管理者代理）——协议一套，直连与代理只是两档</div>
+      <div class="lay">跨域访问<b>一律代理</b>：require 协商出反向管道 → <b>relay_open</b> 串接——<span style="color:#be123c;font-weight:600">不做直连协商</span>（2026-10-26 决策：代理链已流式、够快，直连协商的协议复杂度不划算）</div>
       <div class="lay">交叉节点（如 B1）<b>一节点持多域管理者身份</b>，两域间零新建连接</div>
     </div>
     <ul><li>两个交叉节点并存时按 (uptime, nodeID) 唯一化，防双主脑裂</li></ul>
@@ -271,7 +271,7 @@
   </div>
   <div class="fix">
     <h4>② 升级包改走文件面</h4>
-    <p>十几 MB 二进制不再塞 SFTP-over-WS；直连走 HTTP，不可直连走 TypeBulk。推送失败与超时随之消失。<span class="mono">push.go PushPackage()</span></p>
+    <p>十几 MB 二进制不再塞 SFTP-over-WS；一律 HTTP（直连或代理链，不再区分直连档）。推送失败与超时随之消失。<span class="mono">push.go PushPackage()</span></p>
   </div>
   <div class="fix">
     <h4>③ WSConn 写缓冲 + 通道 keepalive</h4>
