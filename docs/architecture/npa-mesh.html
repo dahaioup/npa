@@ -195,9 +195,9 @@
       <div class="sub">
         <h4>执行面</h4>
         <ul>
-          <li><b>exec</b>：非交互命令，capture stdout/stderr</li>
+          <li><b>exec</b>：非交互命令；另有 <b>/api/exec</b> HTTP 直连路径，失败回退本通道</li>
           <li><b>pty</b>：交互终端（x/crypto/ssh）</li>
-          <li><b>fs</b>：SFTP over WS（pkg/sftp 走管道，不起 sshd）</li>
+          <li><b>文件</b>：优先节点自身 <b>/api/file/*</b> 纯 HTTP（流式、不占通道池）；fs 通道（SFTP over WS）降级为回退</li>
           <li><b>open</b>：任意 TCP（SSH / HTTP / 数据库）</li>
         </ul>
       </div>

@@ -180,6 +180,7 @@
             <div class="chips">
               <span class="chip blue">/mcp → MCP（mcp_enabled）</span>
               <span class="chip amber">/api/peers/* · /api/info · /api/topology（peer_enabled）</span>
+              <span class="chip blue">/api/file/* · /api/exec 节点文件/执行面（无鉴权，调试期）</span>
               <span class="chip rose">/download/{token} 一次性</span>
             </div>
           </div>
@@ -353,13 +354,14 @@
       <h3><span class="bar" style="background:var(--teal)"></span>数据面（不自造协议栈）</h3>
       <dl class="kv">
         <dt>SSH</dt><dd>direct-tcpip / forwarded-tcpip，x/crypto/ssh</dd>
-        <dt>SFTP</dt><dd>SSH 会话内，或反向 WS 通道上的 pkg/sftp</dd>
-        <dt>Peer</dt><dd>WS 首帧声明通道：open / exec / pty / fs / relay_open</dd>
-        <dt>HTTP</dt><dd>/proxy/{id}/ 受控反代，默认拒绝公网目标</dd>
+        <dt>SFTP</dt><dd>SSH 节点保留；peer 节点降级为回退（优先 /api/file/* 纯 HTTP）</dd>
+        <dt>Peer</dt><dd>WS 首帧声明通道：open / exec / pty / fs / relay_open；直连失败可经持有上级代理</dd>
+        <dt>HTTP</dt><dd>/proxy/{id}/ 受控反代；节点文件面 /api/file/* 与执行面 /api/exec；跨域兜底 peer_relay_fallback</dd>
       </dl>
       <div class="chips" style="margin-top:8px">
         <span class="chip teal">单跳 Relay</span>
         <span class="chip teal">NPA 映射 + SSH 映射串联</span>
+        <span class="chip teal">跨域 A→B→N 代理（e2e 已验证）</span>
       </div>
     </div>
 
