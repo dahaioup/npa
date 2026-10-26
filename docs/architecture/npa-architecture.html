@@ -241,8 +241,9 @@
           <div class="card">
             <h4>File Service <span class="mono">internal/file</span></h4>
             <ul>
-              <li>pkg/sftp：列目录 / 读 / 写 / 上传 / 下载 / 改名</li>
-              <li>寻址透明：SSH 节点走 SFTP，peer 节点走 WS 上的 SFTP</li>
+              <li>选路三级降级：peer 节点 HTTP 直连 → 跨域经持有上级代理 → SFTP 回退</li>
+              <li>上传/下载全流式不限大小；read/write 小文件接口 4 MiB（MCP JSON 保命）</li>
+              <li>寻址透明：调用方不感知底层是 SSH 节点、直连 peer 还是跨域 peer</li>
             </ul>
           </div>
           <div class="card">

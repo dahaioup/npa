@@ -247,6 +247,7 @@
       <div class="box"><b>节点 N</b><span>目标服务所在机器</span></div>
     </div>
   </div>
+  <p class="lead" style="margin-top:10px">文件分发走同一条代理链：A 的上传/下载在直连失败后经 B 拨到 N 自己的 <span class="mono">127.0.0.1:56701</span>，PUT /api/file/upload 全程流式、不限大小、不占通道池；三级选路 = 直连 HTTP → 跨域代理 → SFTP 回退。</p>
 </div>
 
 <!-- ===================== stepper ===================== -->
