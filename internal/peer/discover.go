@@ -19,7 +19,10 @@ import (
 type Candidate struct {
 	Address string        `json:"address"` // host:port
 	RTT     time.Duration `json:"-"`
-	Source  string        `json:"source"` // seed | probe
+	Source  string        `json:"source"` // seed | probe | auto
+	// ID/Name 是候选节点自报的标识（/api/info），供分域选举比较；可能为空。
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
 }
 
 func (c Candidate) Endpoint() string { return c.Address }

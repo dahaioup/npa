@@ -169,10 +169,16 @@ func (s *Service) fetchTopology(ctx context.Context, address string) (peer.Topol
 // topologySelf 描述本机在拓扑中的样子。
 func (s *Service) topologySelf() peer.TopologyNode {
 	local := localNode()
-	return peer.TopologyNode{
+	self := peer.TopologyNode{
 		ID: local.ID, Name: local.Name, Address: local.Address, Port: 56700,
 		Version: local.Version, Protocol: "local", Online: true,
 	}
+	if s.Domain != nil {
+		state := s.Domain.Manager.State()
+		self.Domain = state.Domain
+		self.DomainSeq = state.Seq
+	}
+	return self
 }
 
 // registeredChildren 是本机持有的反向接入下级。
@@ -219,6 +225,12 @@ func (s *Service) candidateUppers() []string {
 			port = meshPort
 		}
 		add(net.JoinHostPort(node.Address, strconv.Itoa(port)))
+	}
+	// 路由探测自动发现的上级（peer_auto_discover_uppers，默认开）
+	for _, candidate := range s.autoUpperCandidates() {
+		if candidate.Address != "" {
+			add(candidate.Address)
+		}
 	}
 	if len(result) > maxUpperCandidates {
 		result = result[:maxUpperCandidates]

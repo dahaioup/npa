@@ -12,9 +12,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
-	"runtime/debug"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -156,6 +156,7 @@ func (s *Server) peerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/peers/require_relay", s.app.Peer.HandleRequireRelay)
 	mux.HandleFunc("GET /api/peers/relay", s.app.Peer.HandleRelay)
 	peer.NewFileAPI().Register(mux)
+	s.app.Domain.Register(mux)
 }
 
 // RecoverMiddleware 兜底任意 handler 的 panic，避免单请求打崩整个进程。
@@ -241,6 +242,11 @@ func (s *Server) handlePeerSettings(w http.ResponseWriter, r *http.Request) {
 			size, err := strconv.Atoi(strings.TrimSpace(value))
 			if err != nil || size < 1 || size > 32 {
 				writeError(w, apperrors.New(apperrors.InvalidArgument, "peer_pool_size 必须在 1-32 之间"))
+				return
+			}
+		case "peer_auto_discover_uppers":
+			if value != "true" && value != "false" {
+				writeError(w, apperrors.New(apperrors.InvalidArgument, "peer_auto_discover_uppers 只接受 true/false"))
 				return
 			}
 		}

@@ -45,6 +45,9 @@ const Version = "0.4.1-phase3"
 // 旧库残留值一律忽略），见 cmd/npa/main.go 的 meshSupervisor。
 const meshPort = 56701
 
+// heartbeatBootstrapInterval 分域管理者引导选举的周期（与成员心跳同量级）。
+const heartbeatBootstrapInterval = 20 * time.Second
+
 type Service struct {
 	Store             *state.Store
 	SSH               *sshx.Manager
@@ -58,6 +61,9 @@ type Service struct {
 	PortMappings      *portmap.Manager
 	Peer              *peer.Hub
 	PeerAgent         *peer.Agent
+	Domain            *peer.DomainHub
+	autoUppersMu      sync.Mutex
+	autoUppers        []peer.Candidate // 上级网络自动发现的最近结果（缓存 10 分钟刷新）
 	resourceDir       string
 	started           time.Time
 	stop              chan struct{}
@@ -197,6 +203,7 @@ func (s *Service) wirePeer() {
 		PoolSize:     func() int { return intSetting(s.Settings()["peer_pool_size"], 4) },
 		Seeds:        func() string { return s.Settings()["peer_seeds"] },
 		ProbeSubnets: func() string { return s.Settings()["peer_probe_subnets"] },
+		AutoDiscover: func() bool { return s.Settings()["peer_auto_discover_uppers"] != "false" },
 		Dial:         s.peerDial,
 		SSHRoutes:    s.sshRouteHints,
 		OnError:      logPeerError,
@@ -205,6 +212,56 @@ func (s *Service) wirePeer() {
 	s.Relay.SetPeerDialer(s.Peer)
 	s.Relay.SetUpperCoordinator(s)
 	s.Peer.StartSweeper() // 临时链路空闲回收（peer_on_demand_idle）
+	// 分域 v2：本机同时带管理者与成员两个角色；uptime 从进程启动算起
+	domainStart := time.Now()
+	s.Domain = peer.NewDomainHub(func() peer.DomainMember {
+		children := len(s.registeredChildren())
+		return peer.DomainMember{
+			ID:          model.NodeIDFromMAC(),
+			Name:        hostname,
+			Address:     net.JoinHostPort(discovery.PrimaryIP(), strconv.Itoa(meshPort)),
+			Port:        meshPort,
+			Uptime:      int64(time.Since(domainStart) / time.Second),
+			CrossDomain: children > 0, // 有下级即天然处于多域交叉，选举优先
+		}
+	})
+	s.Domain.Start(context.Background())
+	s.Domain.SetNeighbors(func() []peer.DomainMember {
+		// 邻域管理者候选：配置/发现的上级 + 已注册下级——
+		// delta 沿树的上下方向双向 push
+		result := []peer.DomainMember{}
+		for _, address := range s.candidateUppers() {
+			if host, port, err := net.SplitHostPort(address); err == nil {
+				result = append(result, peer.DomainMember{Address: net.JoinHostPort(host, port)})
+			}
+		}
+		for _, child := range s.registeredChildren() {
+			result = append(result, peer.DomainMember{
+				ID: child.ID, Address: net.JoinHostPort(child.Address, strconv.Itoa(meshPort)),
+			})
+		}
+		return result
+	})
+	s.Domain.StartDeltaPush()
+	// 上级网络自动发现（peer_auto_discover_uppers，默认开）：无种子时走路由
+	// TTL 探测找上游内网网段并受限探测；结果缓存供 candidateUppers/选举使用。
+	go s.refreshAutoUppersLoop(context.Background())
+	// 管理者引导：周期性把「mDNS 发现的同网段节点 + 已注册下级」作为候选视图
+	// 做确定性选举；当选者是别人就把心跳指过去，是自己就待命收心跳。
+	go func() {
+		ticker := time.NewTicker(heartbeatBootstrapInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if s.Domain == nil || s.Discovery == nil {
+				continue
+			}
+			candidates := s.domainCandidates()
+			if len(candidates) == 0 {
+				continue
+			}
+			s.Domain.Elect(candidates)
+		}
+	}()
 	// mDNS 广播 role/children/peer，便于同网段的其它上级发现我们并查询拓扑
 	if s.Discovery != nil {
 		s.Discovery.SetLocalInfo(func() int {
@@ -214,6 +271,93 @@ func (s *Service) wirePeer() {
 			return meshPort
 		}, func() int { return len(s.registeredChildren()) })
 	}
+}
+
+// domainCandidates 分域管理者选举的候选视图：mDNS 发现的同网段 NPA + 已注册下级。
+func (s *Service) domainCandidates() []peer.DomainMember {
+	selfID := model.NodeIDFromMAC()
+	result := []peer.DomainMember{}
+	add := func(id, name, host string, port int, uptime int64) {
+		if id == "" || id == selfID || host == "" {
+			return
+		}
+		result = append(result, peer.DomainMember{
+			ID: id, Name: name,
+			Address: net.JoinHostPort(host, strconv.Itoa(port)),
+			Port:    port, Uptime: uptime,
+		})
+	}
+	if s.Discovery != nil {
+		if nodes, err := s.Discovery.Nodes(); err == nil {
+			for _, node := range nodes {
+				port := node.PeerPort
+				if port <= 0 {
+					port = meshPort
+				}
+				add(node.ID, node.Name, node.Address, port, node.Uptime)
+			}
+		}
+	}
+	for _, node := range s.registeredChildren() {
+		add(node.ID, node.Name, node.Address, meshPort, 0)
+	}
+	// 路由探测自动发现的上级（peer_auto_discover_uppers）：候选视图最后补上
+	for _, candidate := range s.autoUpperCandidates() {
+		host, portText, err := net.SplitHostPort(candidate.Address)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port <= 0 {
+			port = meshPort
+		}
+		add(candidate.ID, candidate.Name, host, port, 0)
+	}
+	return result
+}
+
+// autoDiscoverInterval 自动发现结果的刷新周期；结果缓存在两次刷新之间复用。
+const autoDiscoverInterval = 10 * time.Minute
+
+// refreshAutoUppersLoop 周期性执行上级网络自动发现并缓存结果。
+// 规则：关了开关、关了 peer、或配了种子（种子优先）就清空/跳过缓存。
+func (s *Service) refreshAutoUppersLoop(ctx context.Context) {
+	refresh := func() {
+		if s.Settings()["peer_enabled"] != "true" ||
+			s.Settings()["peer_auto_discover_uppers"] == "false" ||
+			strings.TrimSpace(s.Settings()["peer_seeds"]) != "" {
+			s.setAutoUppers(nil)
+			return
+		}
+		found, err := peer.AutoDiscoverUppers(ctx, meshPort, discovery.LocalSubnets())
+		if err != nil {
+			return // traceroute 不可用/超时：保留上次结果，下轮再试
+		}
+		s.setAutoUppers(found)
+	}
+	refresh()
+	ticker := time.NewTicker(autoDiscoverInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
+
+func (s *Service) setAutoUppers(candidates []peer.Candidate) {
+	s.autoUppersMu.Lock()
+	s.autoUppers = candidates
+	s.autoUppersMu.Unlock()
+}
+
+func (s *Service) autoUpperCandidates() []peer.Candidate {
+	s.autoUppersMu.Lock()
+	defer s.autoUppersMu.Unlock()
+	return append([]peer.Candidate{}, s.autoUppers...)
 }
 
 // sshRouteHints 把本机已授权的 SSH 跳板上报给上级，
@@ -427,6 +571,7 @@ func (s *Service) PeerStatus() map[string]any {
 		"port":          meshPort,
 		"seeds":         settings["peer_seeds"],
 		"probe_subnets": settings["peer_probe_subnets"],
+		"auto_discover": settings["peer_auto_discover_uppers"] != "false",
 		"pool_size":     intSetting(settings["peer_pool_size"], 4),
 		"auto_trust":    parseBool(settings["peer_auto_trust"]),
 		"address":       discovery.PrimaryIP(),

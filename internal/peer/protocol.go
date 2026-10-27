@@ -59,6 +59,9 @@ type TopologyNode struct {
 	Via     string `json:"via,omitempty"` // direct | relay:<upper>
 	Unknown bool   `json:"unknown,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// Domain 是分域 v2 的域标识（= 域内当选管理者 ID）；DomainSeq 单调推进。
+	Domain    string `json:"domain,omitempty"`
+	DomainSeq uint64 `json:"domain_seq,omitempty"`
 }
 
 // Topology 是一次拓扑查询的返回：自己 + 其直接下级 + 它的上级（可再向上递归）。
@@ -127,6 +130,7 @@ type ExecFrame struct {
 // Info 是上级返回给下级的自描述信息，用于探测识别 NPA。
 type Info struct {
 	Product   string   `json:"product"`
+	ID        string   `json:"id,omitempty"` // 节点自报标识，供分域选举比较
 	Name      string   `json:"name"`
 	Version   string   `json:"version"`
 	PeerPort  int      `json:"peer_port"`

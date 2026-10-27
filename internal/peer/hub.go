@@ -126,10 +126,16 @@ func (h *Hub) info() Info {
 	if h.opts.Subnets != nil {
 		subnets = h.opts.Subnets()
 	}
-	return Info{
+	info := Info{
 		Product: "npa", Name: h.opts.Name, Version: h.opts.Version, PeerPort: port,
 		Subnets: subnets, Protocols: []string{"register", "link", "conn", TypeOpen, TypeExec, TypePTY, TypeFS, TypeRelayOpen},
 	}
+	if h.opts.Self != nil {
+		if self := h.opts.Self(); self.ID != "" {
+			info.ID = self.ID
+		}
+	}
+	return info
 }
 
 // ResetLinksOnStart 在本机启动（或重启）后调用：

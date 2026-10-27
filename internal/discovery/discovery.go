@@ -39,6 +39,8 @@ type Manager struct {
 	status  string
 	lastErr string
 	localID string
+	// startedAt 进程启动时刻；mDNS TXT 广播 uptime= 运行秒数，供分域管理者选举。
+	startedAt time.Time
 	// peerPort / children 用于 mDNS TXT（role、children、peer），由 service 注入
 	peerPort func() int
 	children func() int
@@ -73,8 +75,11 @@ func (m *Manager) localChildren() int {
 	return fn()
 }
 
+// localUptime 本机进程运行秒数（分域管理者选举广播）。
+func (m *Manager) localUptime() int64 { return int64(time.Since(m.startedAt) / time.Second) }
+
 func NewManager(repo Repository, version string) *Manager {
-	return &Manager{repo: repo, version: version, status: "disabled"}
+	return &Manager{repo: repo, version: version, status: "disabled", startedAt: time.Now()}
 }
 
 // LocalIPs 返回本机私网单播地址（IPv4 优先，排序稳定），用于节点自报可达地址。
@@ -177,6 +182,7 @@ func (m *Manager) txtRecord(nodeID, name string, subnets []string, capabilities 
 		"peer=" + strconv.Itoa(peerPort),
 		"role=" + role,
 		"children=" + strconv.Itoa(children),
+		"up=" + strconv.FormatInt(m.localUptime(), 10),
 		"caps=" + strings.Join(capabilities, ","),
 		"subnets=" + strings.Join(subnets, ","),
 	}
@@ -366,6 +372,7 @@ func (m *Manager) resolveWithDnsSD(ctx context.Context, instance string) {
 		Capabilities: splitCSV(values["caps"]), ReachableSubnets: splitCSV(values["subnets"]),
 		Version:    strings.TrimSpace(values["ver"]),
 		PeerPort:   atoiOr(values["peer"], 0),
+		Uptime:     int64(atoiOr(values["up"], 0)),
 		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	if node.Name == "" {
@@ -438,6 +445,7 @@ func parseEntry(entry *zeroconf.ServiceEntry) (model.Node, bool) {
 		Version: strings.TrimSpace(values["ver"]),
 		// 旧版本节点在 mDNS TXT 里广播的是 56710：端口收敛后指向同一个服务
 		PeerPort:   normalizeLegacyPort(peerPort),
+		Uptime:     int64(atoiOr(values["up"], 0)),
 		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}, true
 }

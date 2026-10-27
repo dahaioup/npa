@@ -33,6 +33,9 @@ type AgentOptions struct {
 	PoolSize     func() int
 	Seeds        func() string
 	ProbeSubnets func() string
+	// AutoDiscover 无种子时的上级网络自动发现开关（peer_auto_discover_uppers，
+	// 默认开）：traceroute 找上游内网网段 → 受限探测 56701。有种子只用种子。
+	AutoDiscover func() bool
 	SSHRoutes    func() []model.RemoteRoute
 	Dial         DialFunc
 	OnError      func(error)
@@ -192,15 +195,29 @@ func (a *Agent) loop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		candidates, err := Discover(ctx, a.seeds(), a.probeSubnets(), DefaultPort)
+		// 规则（2026-10-26）：配了种子就只用种子；没种子且没配探测网段、
+		// 且自动发现开着，才走路由 TTL 探测自动找上级网络。
+		autoMode := strings.TrimSpace(a.seeds()) == "" &&
+			strings.TrimSpace(a.probeSubnets()) == "" && a.autoDiscover()
+		var candidates []Candidate
+		var err error
+		if autoMode {
+			subnets := []string{}
+			if a.opts.Subnets != nil {
+				subnets = a.opts.Subnets()
+			}
+			candidates, err = AutoDiscoverUppers(ctx, DefaultPort, subnets)
+		} else {
+			candidates, err = Discover(ctx, a.seeds(), a.probeSubnets(), DefaultPort)
+		}
 		a.set(func(s *Status) { s.Candidates = candidates })
 		switch {
 		case err != nil:
 			a.record(err)
 		case len(candidates) == 0:
-			// 既没配种子也没配探测网段：本机多半只是在当"上级"运行，
-			// 这不是错误，不记录、不打日志，只保持中性状态。
-			if strings.TrimSpace(a.seeds()) == "" && strings.TrimSpace(a.probeSubnets()) == "" {
+			// 既没配种子也没配探测网段（或自动发现扑空）：本机多半只是在
+			// 当"上级"运行，这不是错误，不记录、不打日志，只保持中性状态。
+			if autoMode || strings.TrimSpace(a.seeds()) == "" && strings.TrimSpace(a.probeSubnets()) == "" {
 				a.set(func(s *Status) { s.LastError = "" })
 				if !sleep(ctx, 5*time.Second) {
 					return
@@ -290,6 +307,11 @@ func (a *Agent) probeSubnets() string {
 		return ""
 	}
 	return a.opts.ProbeSubnets()
+}
+
+// autoDiscover 缺省开启：只有设置显式写 "false" 才关。
+func (a *Agent) autoDiscover() bool {
+	return a.opts.AutoDiscover == nil || a.opts.AutoDiscover()
 }
 
 func (a *Agent) serveFirstReachable(ctx context.Context, candidates []Candidate) error {

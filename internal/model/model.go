@@ -30,6 +30,8 @@ type Node struct {
 	Version string `json:"version,omitempty"`
 	// PeerPort 是对端广播的反向接入端口（跨上级查拓扑要用）。
 	PeerPort int `json:"peer_port,omitempty"`
+	// Uptime 是对端 mDNS 广播的进程运行秒数（分域管理者选举的比较项）。
+	Uptime int64 `json:"uptime_seconds,omitempty"`
 	// Online 由 ListNodes 计算：peer 看反向链路是否在线，其余节点做快速探测。
 	Online bool `json:"online"`
 	// UpdateAvailable 由 ListNodes 计算：该节点版本严格新于本机。
