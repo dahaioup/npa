@@ -78,6 +78,8 @@ sequenceDiagram
 - **文件/执行面（HTTP，优先）**：peer 节点在 56701 上暴露 `/api/file/*`（list/stat/read/download/upload/write/mkdir/remove/rename，流式）与 `POST /api/exec`。上级对 peer 的文件操作（含升级包推送）与 exec **优先走这两个端点**，SFTP-over-WS 与 TypeExec 通道降级为回退——大文件不再挤占通道池（exec/PTY/隧道饿死的根因）。
 - **设计决策（2026-10-26）：放弃直连协商**——跨域访问一律走代理链（require 协商反向管道 + relay_open 串接）。代理已全流式、延迟与带宽在局域网规模下不构成瓶颈，直连协商的协议复杂度（地址通告、协商竞态、双链路活性）不划算；出现持续大流量或跨公网链路时再重评。
 - **跨域兜底**：目标节点挂在别的上级下时，`DialNode` 直连失败自动按节点 ID 在拓扑里找到持有上级，经 A→B→N 代理拨到**节点自己的 56701**，文件/exec 照常可用（需 `peer_relay_fallback=true`；中间持有者地址不通时在其上设 `peer_advertise`）。隧道/端口映射/Web 代理共用该入口，跨域 RustDesk 场景因此可用。端到端验证：`TestCrossUpperPushAndTunnel`。
+- **上级网络自动发现（2026-10-26，`internal/peer/routeprobe.go`）**：规则是**有种子只用种子，无种子自动发现**（`peer_auto_discover_uppers`，默认开）。自动链路：traceroute/tracert（前 6 跳）拿到出站路径 → 取第一个不属于本机网段的 RFC1918 私网跳（它是上游内网路由被下一跳 ICMP「报」出来的接口地址）→ 其 /24 走既有受限探测（只碰 56701 + `/api/info`）→ 命中一个网段即停。结果进 `candidateUppers`/domainCandidates（拓扑查询、delta 推送、分域选举都吃这份），Agent 侧同开关接入发现循环（NAT/直连出口拓扑探测不到，仍需种子兜底）。刷新周期 10 分钟。`/api/info` 新增 `id` 供选举比较。
+- **分域 v2（2026-10-26 落地，`internal/peer/domain.go`）**：同网段 mDNS 互相发现的节点构成域（连通分量的近似——与「一律代理」决策一致，不做主动探测图）。域内管理者按 (交叉节点优先, uptime, nodeID) 确定性选举；成员每 20s 心跳拉取域状态（兼增量），3×20s 判死；管理者失联成员本地重选（排除死者防尸体循环），升格时 **epoch+1 防旧主复活**（旧 epoch 的 delta 拒收）。管理者间增量：`onChange` 触发 POST `/api/domain/delta`（单调 epoch+seq，断档 409 → GET `/api/domain/state` 全量 pull 兜底），邻域=配置上级 + mDNS 节点 + 已注册下级。mDNS TXT 新增 `up=`（uptime）供选举。端点 `/api/domain/{heartbeat,state,delta}` 挂 56701；`/api/topology` self 节点新增 `domain`/`domain_seq`。验证：`TestDomainElectionConvergence`（三节点收敛→杀主→故障转移）、`TestDeltaPushBetweenManagers`、`TestBumpEpochRejectsStaleMaster`。
 
 ## 5. MCP 与权限
 
