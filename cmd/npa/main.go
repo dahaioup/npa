@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/npa/npa/internal/guardian"
 	"github.com/npa/npa/internal/mcp"
 	"github.com/npa/npa/internal/service"
 	"github.com/npa/npa/internal/state"
@@ -105,10 +106,22 @@ func main() {
 	dataDir := flag.String("data-dir", "", "internal state directory (default ~/.npa)")
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	guardianConfig := flag.String("guardian-config", "", "run in guardian mode (remote-upgrade watchdog) with the given JSON config file, then exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+	// 守护模式：只做远程升级的看门狗，不启动完整服务。放在最前面，
+	// 避免为守护进程打开状态库/监听端口。
+	if *guardianConfig != "" {
+		setupGuardianLogger(*dataDir)
+		cfg, err := guardian.LoadFile(*guardianConfig)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "guardian config:", err)
+			os.Exit(2)
+		}
+		os.Exit(int(guardian.Run(cfg)))
 	}
 	level := slog.LevelInfo
 	switch strings.ToLower(*logLevel) {
@@ -257,6 +270,19 @@ func requestShutdown() {
 }
 
 const logRotateSize = 10 << 20
+
+// setupGuardianLogger 让守护进程把日志写到独立文件（guardian.log），
+// 与主程序的 npa.log 分开，便于事后排查升级过程。
+func setupGuardianLogger(dataDirFlag string) {
+	dir := dataDirPath(dataDirFlag)
+	full := filepath.Join(dir, "guardian.log")
+	file, err := os.OpenFile(full, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	var w io.Writer = os.Stderr
+	if err == nil {
+		w = io.MultiWriter(os.Stderr, file)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})))
+}
 
 func dataDirPath(flagValue string) string {
 	if value := strings.TrimSpace(flagValue); value != "" {
