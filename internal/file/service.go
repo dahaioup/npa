@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -83,6 +84,54 @@ func (s *Service) httpTarget(ctx context.Context, nodeID string) (*http.Client, 
 		return relayHTTPClient(ctx, nodeID, s.RelayDial), "http://mesh", true
 	}
 	return nil, "", false
+}
+
+// httpJSON 在节点的 HTTP 文件面上调用一次 JSON 接口。目标节点有直连基址
+// （反向接入/同网段发现）或可经上级代理时返回 done=true；失败由调用方决定
+// 是否回退 SSH 通道。
+func (s *Service) httpJSON(ctx context.Context, nodeID, method, endpoint string, payload []byte, out any) (bool, error) {
+	client, base, ok := s.httpTarget(ctx, nodeID)
+	if !ok {
+		return false, nil
+	}
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+endpoint, body)
+	if err != nil {
+		return true, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return true, apperrors.New(apperrors.NodeOffline, fmt.Sprintf("node file api %d: %s", resp.StatusCode, strings.TrimSpace(string(message))))
+	}
+	if out == nil {
+		return true, nil
+	}
+	return true, json.NewDecoder(resp.Body).Decode(out)
+}
+
+// httpFileEntry 与节点 fileapi.go 里的结构一一对应。
+type httpFileEntry struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Size        int64  `json:"size"`
+	Mode        string `json:"mode"`
+	ModTimeUnix int64  `json:"mod_time_unix"`
+	IsDir       bool   `json:"is_dir"`
+}
+
+func (e httpFileEntry) model() model.FileEntry {
+	return model.FileEntry{
+		Name: e.Name, Path: e.Path, Size: e.Size, Mode: e.Mode,
+		ModTime: time.Unix(e.ModTimeUnix, 0).UTC(), IsDir: e.IsDir,
+	}
 }
 
 func (s *Service) httpUploadWith(ctx context.Context, client *http.Client, base, remotePath string, source io.Reader) (int64, error) {
@@ -250,6 +299,17 @@ func (s *Service) client(ctx context.Context, nodeID string) (*sftp.Client, func
 }
 
 func (s *Service) List(ctx context.Context, nodeID, remotePath string) ([]model.FileEntry, error) {
+	var listed []httpFileEntry
+	if done, err := s.httpJSON(ctx, nodeID, http.MethodGet, "/api/file/list?path="+url.QueryEscape(remotePath), nil, &listed); done {
+		if err == nil {
+			entries := make([]model.FileEntry, 0, len(listed))
+			for _, entry := range listed {
+				entries = append(entries, entry.model())
+			}
+			return entries, nil
+		}
+		slog.Warn("node file api list failed; falling back to sftp", "node", nodeID, "error", err)
+	}
 	client, closeClient, err := s.client(ctx, nodeID)
 	if err != nil {
 		return nil, err
@@ -277,6 +337,13 @@ func (s *Service) List(ctx context.Context, nodeID, remotePath string) ([]model.
 }
 
 func (s *Service) Stat(ctx context.Context, nodeID, remotePath string) (model.FileEntry, error) {
+	var entry httpFileEntry
+	if done, err := s.httpJSON(ctx, nodeID, http.MethodGet, "/api/file/stat?path="+url.QueryEscape(remotePath), nil, &entry); done {
+		if err == nil {
+			return entry.model(), nil
+		}
+		slog.Warn("node file api stat failed; falling back to sftp", "node", nodeID, "error", err)
+	}
 	client, closeClient, err := s.client(ctx, nodeID)
 	if err != nil {
 		return model.FileEntry{}, err
@@ -293,6 +360,17 @@ func (s *Service) Stat(ctx context.Context, nodeID, remotePath string) (model.Fi
 }
 
 func (s *Service) Read(ctx context.Context, nodeID, remotePath string) ([]byte, error) {
+	if reader, err := s.OpenRead(ctx, nodeID, remotePath); err == nil {
+		defer reader.Close()
+		data, err := io.ReadAll(io.LimitReader(reader, maxReadSize+1))
+		if err != nil {
+			return nil, apperrors.Wrap(apperrors.NodeOffline, "cannot read remote file", err)
+		}
+		if len(data) > maxReadSize {
+			return nil, apperrors.New(apperrors.InvalidArgument, "file exceeds MCP read limit; use download")
+		}
+		return data, nil
+	}
 	client, closeClient, err := s.client(ctx, nodeID)
 	if err != nil {
 		return nil, err
@@ -422,6 +500,12 @@ func (s *Service) Upload(ctx context.Context, nodeID, remotePath string, source 
 }
 
 func (s *Service) Remove(ctx context.Context, nodeID, remotePath string) error {
+	if done, err := s.httpJSON(ctx, nodeID, http.MethodPost, "/api/file/remove?path="+url.QueryEscape(remotePath), nil, nil); done {
+		if err == nil {
+			return nil
+		}
+		slog.Warn("node file api remove failed; falling back to sftp", "node", nodeID, "error", err)
+	}
 	client, closeClient, err := s.client(ctx, nodeID)
 	if err != nil {
 		return err
@@ -443,6 +527,12 @@ func (s *Service) Remove(ctx context.Context, nodeID, remotePath string) error {
 }
 
 func (s *Service) Mkdir(ctx context.Context, nodeID, remotePath string) error {
+	if done, err := s.httpJSON(ctx, nodeID, http.MethodPost, "/api/file/mkdir?path="+url.QueryEscape(remotePath), nil, nil); done {
+		if err == nil {
+			return nil
+		}
+		slog.Warn("node file api mkdir failed; falling back to sftp", "node", nodeID, "error", err)
+	}
 	client, closeClient, err := s.client(ctx, nodeID)
 	if err != nil {
 		return err
@@ -455,6 +545,13 @@ func (s *Service) Mkdir(ctx context.Context, nodeID, remotePath string) error {
 }
 
 func (s *Service) Rename(ctx context.Context, nodeID, oldPath, newPath string) error {
+	endpoint := "/api/file/rename?from=" + url.QueryEscape(oldPath) + "&to=" + url.QueryEscape(newPath)
+	if done, err := s.httpJSON(ctx, nodeID, http.MethodPost, endpoint, nil, nil); done {
+		if err == nil {
+			return nil
+		}
+		slog.Warn("node file api rename failed; falling back to sftp", "node", nodeID, "error", err)
+	}
 	client, closeClient, err := s.client(ctx, nodeID)
 	if err != nil {
 		return err

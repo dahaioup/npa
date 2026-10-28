@@ -142,6 +142,11 @@ go build -o npa ./cmd/npa
 ./npa
 ```
 
+发布包用 `scripts/build-release.sh` 生成：交叉编译 darwin/linux/windows 共 7 个平台，
+版本号按构建时刻注入为 `v0.4.1-<Unix 秒>`（`-ldflags -X .../internal/service.Version=0.4.1-<epoch>`，界面统一加 `v`），
+产物在 `dist/npa-all_<时间戳>/`，同时打出带 UTF-8 文件名的 zip。
+直接 `go build` 的版本是 `v0.4.1-dev`。
+
 启动后访问 `http://127.0.0.1:56700`。常用诊断参数：
 
 ```text

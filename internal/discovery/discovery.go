@@ -1,15 +1,12 @@
 package discovery
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -125,8 +122,63 @@ func LocalIPs() []string {
 	return result
 }
 
+// onMDNSInstance 把轮询器解析出的实例写成发现节点。
+func (m *Manager) onMDNSInstance(instance mdnsInstance) {
+	values := map[string]string{}
+	for _, field := range instance.TXT {
+		key, value, ok := strings.Cut(field, "=")
+		if ok {
+			values[strings.ToLower(key)] = value
+		}
+	}
+	id := values["id"]
+	if id == "" {
+		id = instance.Instance
+	}
+	if id == m.localID {
+		return
+	}
+	if len(instance.Addrs) == 0 {
+		return
+	}
+	name := values["name"]
+	if name == "" {
+		name = instance.Instance
+	}
+	now := time.Now().UTC()
+	node := model.Node{
+		ID: id, DisplayID: values["id"], Name: name,
+		Address: instance.Addrs[0].String(), Port: instance.Port,
+		AuthMethod: "discovered", Protocol: "discovered", Status: "discovered",
+		Capabilities: splitCSV(values["caps"]), ReachableSubnets: splitCSV(values["subnets"]),
+		Version: strings.TrimSpace(values["ver"]),
+		// 旧版本节点在 mDNS TXT 里广播的是 56710：端口收敛后指向同一个服务
+		PeerPort:   normalizeLegacyPort(atoiOr(values["peer"], 0)),
+		Uptime:     int64(atoiOr(values["up"], 0)),
+		Discovered: true, LastSeen: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := m.repo.SaveDiscoveredNode(node); err != nil {
+		slog.Warn("cannot persist mdns discovered node", "id", node.ID, "error", err)
+		return
+	}
+	slog.Info("mDNS entry received", "id", node.ID, "name", node.Name, "address", node.Address, "peer_port", node.PeerPort)
+}
+
 // PrimaryIP 返回本机首选私网地址，取不到时退回回环地址。
 func PrimaryIP() string {
+	// 先问内核“去公网会走哪张网卡”，拿到出口地址：虚拟机/VPN 的虚拟网卡
+	// （172.31.x、192.168.110.1 之类）不会出现在这条路径上。
+	// UDP 的 Dial 不发包，只是让内核选路。
+	if conn, err := net.Dial("udp4", "223.5.5.5:53"); err == nil {
+		if local, ok := conn.LocalAddr().(*net.UDPAddr); ok && local.IP != nil {
+			ip := local.IP
+			if parsed, ok := netip.AddrFromSlice(ip.To4()); ok && !parsed.IsLoopback() && parsed.IsPrivate() {
+				conn.Close()
+				return parsed.String()
+			}
+		}
+		conn.Close()
+	}
 	addresses := LocalIPs()
 	if len(addresses) == 0 {
 		return "127.0.0.1"
@@ -257,197 +309,16 @@ func (m *Manager) start(ctx context.Context) error {
 		m.mu.Unlock()
 		return err
 	}
+	// 广播用 zeroconf，接收用自己的轮询器：库的 Browse 只在单个报文里凑齐
+	// PTR+SRV+TXT+A 才产出条目，NPA 应答 PTR 时只带 PTR，于是永远收不到。
 	browseCtx, cancel := context.WithCancel(context.Background())
-	entries := make(chan *zeroconf.ServiceEntry, 16)
-	resolver, err := zeroconf.NewResolver()
-	if err == nil {
-		err = resolver.Browse(browseCtx, serviceType, "local.", entries)
-	}
-	if err != nil {
-		cancel()
-		server.Shutdown()
-		m.mu.Lock()
-		m.status, m.lastErr = "failed", err.Error()
-		m.mu.Unlock()
-		return err
-	}
 	m.mu.Lock()
 	m.server, m.cancel, m.status = server, cancel, "running"
 	m.mu.Unlock()
-	go m.consume(entries, browseCtx)
-	if runtime.GOOS == "darwin" {
-		go m.browseWithDnsSD(browseCtx)
-	}
+	go newMDNSPoller(m.onMDNSInstance).start(browseCtx)
 	slog.Info("mDNS discovery started", "instance", instance, "service", serviceType+".local.")
 	_ = ctx
 	return nil
-}
-
-func (m *Manager) browseWithDnsSD(ctx context.Context) {
-	cmd := exec.CommandContext(ctx, "dns-sd", "-B", serviceType, "local.")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		slog.Debug("dns-sd fallback unavailable", "error", err)
-		return
-	}
-	seen := map[string]struct{}{}
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) == 0 || fields[1] != "Add" {
-			continue
-		}
-		instance := fields[len(fields)-1]
-		if instance == "" {
-			continue
-		}
-		if _, exists := seen[instance]; exists {
-			continue
-		}
-		seen[instance] = struct{}{}
-		go m.resolveWithDnsSD(ctx, instance)
-	}
-	_ = cmd.Wait()
-}
-
-func (m *Manager) resolveWithDnsSD(ctx context.Context, instance string) {
-	resolveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(resolveCtx, "dns-sd", "-L", instance, serviceType, "local.")
-	output, _ := cmd.Output()
-	lines := strings.Split(string(output), "\n")
-	var hostPort, txtLine string
-	for _, line := range lines {
-		if strings.Contains(line, "can be reached at ") {
-			hostPort = strings.TrimSpace(line[strings.Index(line, "can be reached at ")+len("can be reached at "):])
-			if index := strings.Index(hostPort, " (interface"); index >= 0 {
-				hostPort = strings.TrimSpace(hostPort[:index])
-			}
-		} else if strings.HasPrefix(strings.TrimSpace(line), "id=") {
-			txtLine = strings.TrimSpace(line)
-		}
-	}
-	if hostPort == "" || txtLine == "" {
-		return
-	}
-	host, portText, err := net.SplitHostPort(hostPort)
-	if err != nil {
-		return
-	}
-	host = strings.TrimSuffix(host, ".")
-	addresses, err := net.LookupIP(host)
-	if err != nil || len(addresses) == 0 {
-		return
-	}
-	selectedAddress := addresses[0]
-	for _, address := range addresses {
-		if address.To4() != nil {
-			selectedAddress = address
-			break
-		}
-	}
-	values := map[string]string{}
-	for _, field := range strings.Fields(txtLine) {
-		if key, value, ok := strings.Cut(field, "="); ok {
-			values[strings.ToLower(key)] = value
-		}
-	}
-	id := values["id"]
-	if id == "" {
-		id = instance
-	}
-	if id == m.localID {
-		return
-	}
-	port, err := net.LookupPort("tcp", portText)
-	if err != nil {
-		return
-	}
-	node := model.Node{
-		ID: id, DisplayID: values["id"], Name: values["name"], Address: selectedAddress.String(), Port: port,
-		AuthMethod: "discovered", Protocol: "discovered", Status: "discovered",
-		Capabilities: splitCSV(values["caps"]), ReachableSubnets: splitCSV(values["subnets"]),
-		Version:    strings.TrimSpace(values["ver"]),
-		PeerPort:   atoiOr(values["peer"], 0),
-		Uptime:     int64(atoiOr(values["up"], 0)),
-		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
-	}
-	if node.Name == "" {
-		node.Name = instance
-	}
-	if err := m.repo.SaveDiscoveredNode(node); err != nil {
-		slog.Warn("cannot persist dns-sd discovered node", "id", node.ID, "error", err)
-		return
-	}
-	slog.Info("dns-sd entry received", "id", node.ID, "name", node.Name, "address", node.Address)
-}
-
-func (m *Manager) consume(entries <-chan *zeroconf.ServiceEntry, ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case entry, ok := <-entries:
-			if !ok {
-				return
-			}
-			slog.Debug("mDNS raw entry", "instance", entry.Instance, "service", entry.Service, "ipv4", len(entry.AddrIPv4), "ipv6", len(entry.AddrIPv6), "text", entry.Text)
-			node, ok := parseEntry(entry)
-			if !ok || node.ID == m.localID {
-				slog.Debug("mDNS entry skipped", "instance", entry.Instance, "parsed", ok, "local_id", m.localID)
-				continue
-			}
-			slog.Info("mDNS entry received", "id", node.ID, "name", node.Name, "address", node.Address)
-			if err := m.repo.SaveDiscoveredNode(node); err != nil {
-				slog.Warn("cannot persist discovered node", "id", node.ID, "error", err)
-			}
-		}
-	}
-}
-
-func parseEntry(entry *zeroconf.ServiceEntry) (model.Node, bool) {
-	if entry == nil {
-		return model.Node{}, false
-	}
-	values := map[string]string{}
-	for _, text := range entry.Text {
-		key, value, found := strings.Cut(text, "=")
-		if found {
-			values[strings.ToLower(key)] = value
-		}
-	}
-	id := values["id"]
-	if id == "" {
-		id = entry.Instance
-	}
-	address := ""
-	if len(entry.AddrIPv4) > 0 {
-		address = entry.AddrIPv4[0].String()
-	} else if len(entry.AddrIPv6) > 0 {
-		address = entry.AddrIPv6[0].String()
-	}
-	if address == "" {
-		return model.Node{}, false
-	}
-	name := values["name"]
-	if name == "" {
-		name = entry.Instance
-	}
-	capabilities := splitCSV(values["caps"])
-	subnets := splitCSV(values["subnets"])
-	peerPort := atoiOr(values["peer"], 0)
-	return model.Node{
-		ID: id, DisplayID: values["id"], Name: name, Address: address, Port: entry.Port, Username: "", AuthMethod: "discovered",
-		Protocol: "discovered", Status: "discovered", Capabilities: capabilities, ReachableSubnets: subnets,
-		Version: strings.TrimSpace(values["ver"]),
-		// 旧版本节点在 mDNS TXT 里广播的是 56710：端口收敛后指向同一个服务
-		PeerPort:   normalizeLegacyPort(peerPort),
-		Uptime:     int64(atoiOr(values["up"], 0)),
-		Discovered: true, LastSeen: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
-	}, true
 }
 
 func atoiOr(value string, fallback int) int {
@@ -492,6 +363,25 @@ func (m *Manager) Refresh(ctx context.Context) error {
 
 func (m *Manager) Nodes() ([]model.Node, error) {
 	return m.repo.ListDiscoveredNodes()
+}
+
+// Find 按节点 ID 查一个发现记录。同网段节点只靠广播互见、没有握手注册，
+// 上层（exec/file）要靠它拿到地址，直接走对端的 mesh HTTP 端口。
+func (m *Manager) Find(id string) (model.Node, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return model.Node{}, false
+	}
+	nodes, err := m.repo.ListDiscoveredNodes()
+	if err != nil {
+		return model.Node{}, false
+	}
+	for _, node := range nodes {
+		if node.ID == id {
+			return node, true
+		}
+	}
+	return model.Node{}, false
 }
 
 // StaleAfter 是发现节点的清理阈值：离线（超过该时长没有再收到它的广播）就从列表移除。

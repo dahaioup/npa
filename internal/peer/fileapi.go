@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -360,12 +359,11 @@ func (f *FileAPI) handleRename(w http.ResponseWriter, r *http.Request) {
 }
 
 func toHTTPEntry(dir string, info os.FileInfo) httpFileEntry {
-	mode := uint32(info.Mode())
 	return httpFileEntry{
 		Name:    info.Name(),
 		Path:    path.Join(filepath.ToSlash(dir), info.Name()),
 		Size:    info.Size(),
-		Mode:    strconv.FormatUint(uint64(mode), 8),
+		Mode:    info.Mode().String(),
 		ModTime: info.ModTime().Unix(),
 		IsDir:   info.IsDir(),
 	}

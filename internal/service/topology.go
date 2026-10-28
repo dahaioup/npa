@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	apperrors "github.com/npa/npa/internal/errors"
@@ -18,7 +21,12 @@ import (
 
 const (
 	topologyCacheTTL = 15 * time.Second
-	topologyTimeout  = 2 * time.Second
+	// topologyTimeout 单次向对端取拓扑的上限：对端现在是"先给缓存、后台刷新"，
+	// 正常响应在毫秒级，这里只兜住对端卡死的情况。
+	topologyTimeout = 800 * time.Millisecond
+	// topologyBuildBudget 冷启动拼整棵树的预算。拓扑是一层一层问上去的，
+	// 串行叠加会让上层超时（界面就显示"拓扑不可达"），所以整树必须有硬预算。
+	topologyBuildBudget = 3 * time.Second
 	// maxTopologyDepth 向上递归的层数，防止环
 	maxTopologyDepth = 4
 	// maxUpperCandidates 单次最多向多少个上级查询，避免广播风暴
@@ -37,13 +45,49 @@ type topologyCacheEntry struct {
 // 由前端按 parent 组树；拉取失败的分支放进 missing，显示为"未知"而不是静默丢弃。
 func (s *Service) Topology(ctx context.Context) (map[string]any, error) {
 	s.mu.Lock()
-	if entry := s.topologyCache; entry != nil && time.Since(entry.at) < topologyCacheTTL {
-		payload := entry.payload
-		s.mu.Unlock()
-		return payload, nil
-	}
+	entry := s.topologyCache
 	s.mu.Unlock()
+	if entry != nil {
+		if time.Since(entry.at) >= topologyCacheTTL {
+			// 先给旧值、后台刷新。拓扑要逐级向上问，同步聚合会把延迟叠加给上一层，
+			// 上层一旦超时就把它显示成"拓扑不可达"。
+			s.refreshTopologyAsync()
+		}
+		return entry.payload, nil
+	}
+	// 冷启动：并发查询，整树给一个硬预算，超时也返回已经拼出来的部分。
+	buildCtx, cancel := context.WithTimeout(ctx, topologyBuildBudget)
+	defer cancel()
+	return s.buildTopology(buildCtx)
+}
 
+// refreshTopologyAsync 后台刷新拓扑缓存，同一时刻只允许一个刷新在跑。
+func (s *Service) refreshTopologyAsync() {
+	s.mu.Lock()
+	if s.topologyRefreshing {
+		s.mu.Unlock()
+		return
+	}
+	s.topologyRefreshing = true
+	s.mu.Unlock()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 后台刷新 panic 不能带走整个进程：保留上一份缓存继续服务。
+				slog.Error("topology refresh panic", "panic", r, "stack", string(debug.Stack()))
+			}
+			s.mu.Lock()
+			s.topologyRefreshing = false
+			s.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), topologyBuildBudget)
+		defer cancel()
+		_, _ = s.buildTopology(ctx)
+	}()
+}
+
+// buildTopology 真正拼拓扑：本机、下级、上级链、其它已知上级。结果写入缓存。
+func (s *Service) buildTopology(ctx context.Context) (map[string]any, error) {
 	self := s.topologySelf()
 	nodes := []peer.TopologyNode{self}
 	missing := []map[string]string{}
@@ -82,15 +126,19 @@ func (s *Service) Topology(ctx context.Context) (map[string]any, error) {
 		} else {
 			parentAddress = ""
 		}
-		nodes = append(nodes, withParent(topology.Self, parentOfUpper, upperID, seen))
+		if topology.Self.ID != "" {
+			nodes = append(nodes, withParent(topology.Self, parentOfUpper, upperID, seen))
+		}
 		for _, child := range topology.Children {
 			nodes = append(nodes, withParent(child, upperID, child.ID, seen))
 		}
 	}
 
-	// 3) 其它已知上级：mDNS 发现的 NPA + peer_uppers 配置
+	// 3) 其它已知上级：mDNS 发现的 NPA + peer_uppers 配置。
+	// 并发查询，逐台串行会被不可达的节点拖满预算。
+	candidates := make([]string, 0, maxUpperCandidates)
 	for _, address := range s.candidateUppers() {
-		if len(nodes) > 200 {
+		if len(candidates) >= maxUpperCandidates || len(nodes) > 200 {
 			break
 		}
 		key := "@" + address
@@ -98,17 +146,37 @@ func (s *Service) Topology(ctx context.Context) (map[string]any, error) {
 			continue
 		}
 		seen[key] = true
-		topology, err := s.fetchTopology(ctx, address)
-		if err != nil {
-			missing = append(missing, map[string]string{"address": address, "error": err.Error()})
+		candidates = append(candidates, address)
+	}
+	type candidateResult struct {
+		address  string
+		topology peer.Topology
+		err      error
+	}
+	results := make([]candidateResult, len(candidates))
+	var wg sync.WaitGroup
+	for i, address := range candidates {
+		wg.Add(1)
+		go func(i int, address string) {
+			defer wg.Done()
+			topology, err := s.fetchTopology(ctx, address)
+			results[i] = candidateResult{address: address, topology: topology, err: err}
+		}(i, address)
+	}
+	wg.Wait()
+	for _, result := range results {
+		if result.err != nil {
+			missing = append(missing, map[string]string{"address": result.address, "error": result.err.Error()})
 			continue
 		}
-		upperID := topology.Self.ID
+		upperID := result.topology.Self.ID
 		if upperID == "" {
-			upperID = address
+			upperID = result.address
 		}
-		nodes = append(nodes, withParent(topology.Self, "", upperID, seen))
-		for _, child := range topology.Children {
+		if result.topology.Self.ID != "" {
+			nodes = append(nodes, withParent(result.topology.Self, "", upperID, seen))
+		}
+		for _, child := range result.topology.Children {
 			nodes = append(nodes, withParent(child, upperID, child.ID, seen))
 		}
 	}
@@ -160,8 +228,48 @@ func (s *Service) fetchTopology(ctx context.Context, address string) (peer.Topol
 	if response.StatusCode != http.StatusOK {
 		return topology, apperrors.New(apperrors.NodeOffline, "拓扑查询返回 "+strconv.Itoa(response.StatusCode))
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&topology); err != nil {
+	// 对端 /api/topology 返回的是扁平结构 {self_id, nodes:[{...,parent}], missing}，
+	// 不是 peer.Topology 的嵌套形状；直接按嵌套结构解码会得到一个空节点，
+	// 界面上就多出「无名节点」并把上级树整段丢掉。这里按 parent 关系还原。
+	raw, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
 		return topology, err
+	}
+	// 两种形状都要认：
+	//   peer 面（hub.HandleTopology）返回嵌套的 {self, parent, children}；
+	//   Web 面返回扁平的 {self_id, nodes:[{...,parent}], missing}。
+	// 同一个地址 56701 上挂哪个取决于 mux 注册顺序，所以按内容判断。
+	if err := json.Unmarshal(raw, &topology); err == nil && topology.Self.ID != "" {
+		return topology, nil
+	}
+	var payload struct {
+		SelfID string              `json:"self_id"`
+		Nodes  []peer.TopologyNode `json:"nodes"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return topology, err
+	}
+	byID := make(map[string]peer.TopologyNode, len(payload.Nodes))
+	for _, node := range payload.Nodes {
+		if node.ID != "" {
+			byID[node.ID] = node
+		}
+	}
+	self, ok := byID[payload.SelfID]
+	if !ok {
+		return topology, nil
+	}
+	topology.Self = self
+	for _, node := range payload.Nodes {
+		if node.ID == "" || node.ID == payload.SelfID || node.Parent != payload.SelfID {
+			continue
+		}
+		topology.Children = append(topology.Children, node)
+	}
+	if self.Parent != "" {
+		if parent, found := byID[self.Parent]; found {
+			topology.Parent = &parent
+		}
 	}
 	return topology, nil
 }

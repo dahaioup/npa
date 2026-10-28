@@ -38,7 +38,15 @@ import (
 	"github.com/pkg/sftp"
 )
 
-const Version = "0.4.1-phase3"
+// Version 是当前构建的版本号，形如 0.4.1-1793220000（-后面是构建时刻的
+// Unix 秒级时间戳）。界面统一在版本号前加 v，所以这里不带 v 前缀。
+// 发布构建由 scripts/build-release.sh 通过
+//
+//	-ldflags "-X github.com/npa/npa/internal/service.Version=0.4.1-<epoch 秒>"
+//
+// 注入；直接 go build / go test 时保留这个默认值。必须是 var（const 无法被
+// ldflags 改写）。
+var Version = "0.4.1-dev"
 
 // meshPort 是节点间通信的固定端口：注册、控制长连接、数据池、协调 RPC
 // 与 MCP 共用 56701。节点通信端口不再可配（peer_port 设置项已废弃，
@@ -49,32 +57,33 @@ const meshPort = 56701
 const heartbeatBootstrapInterval = 20 * time.Second
 
 type Service struct {
-	Store             *state.Store
-	SSH               *sshx.Manager
-	Files             *file.Service
-	Tunnels           *tunnel.Manager
-	Audit             *audit.Logger
-	Desktop           *desktop.Router
-	Plugin            *plugin.Manager
-	Discovery         *discovery.Manager
-	Relay             *relay.Manager
-	PortMappings      *portmap.Manager
-	Peer              *peer.Hub
-	PeerAgent         *peer.Agent
-	Domain            *peer.DomainHub
-	autoUppersMu      sync.Mutex
-	autoUppers        []peer.Candidate // 上级网络自动发现的最近结果（缓存 10 分钟刷新）
-	resourceDir       string
-	started           time.Time
-	stop              chan struct{}
-	stopOnce          sync.Once
-	requireInflight   sync.Map // nodeID -> *sync.WaitGroup：同目标在途 require 去重
-	holderCooldown    sync.Map // holderAddress -> time.Time：require 失败冷却
-	topologyCache     *topologyCacheEntry
-	downloadTokens    map[string]downloadToken
-	mu                sync.RWMutex
-	limiter           map[string]*rateWindow
-	OnSettingsChanged func()
+	Store              *state.Store
+	SSH                *sshx.Manager
+	Files              *file.Service
+	Tunnels            *tunnel.Manager
+	Audit              *audit.Logger
+	Desktop            *desktop.Router
+	Plugin             *plugin.Manager
+	Discovery          *discovery.Manager
+	Relay              *relay.Manager
+	PortMappings       *portmap.Manager
+	Peer               *peer.Hub
+	PeerAgent          *peer.Agent
+	Domain             *peer.DomainHub
+	autoUppersMu       sync.Mutex
+	autoUppers         []peer.Candidate // 上级网络自动发现的最近结果（缓存 10 分钟刷新）
+	resourceDir        string
+	started            time.Time
+	stop               chan struct{}
+	stopOnce           sync.Once
+	requireInflight    sync.Map // nodeID -> *sync.WaitGroup：同目标在途 require 去重
+	holderCooldown     sync.Map // holderAddress -> time.Time：require 失败冷却
+	topologyCache      *topologyCacheEntry
+	topologyRefreshing bool
+	downloadTokens     map[string]downloadToken
+	mu                 sync.RWMutex
+	limiter            map[string]*rateWindow
+	OnSettingsChanged  func()
 }
 
 type rateWindow struct {
@@ -105,14 +114,9 @@ func New(store *state.Store) *Service {
 	fileService.PeerFS = func(ctx context.Context, nodeID string) (*sftp.Client, func(), error) {
 		return app.Peer.FS(ctx, nodeID)
 	}
-	// HTTP 文件面：peer 节点可直连时大文件不走 SFTP-over-WS 通道。
-	fileService.PeerHTTPBase = func(nodeID string) string {
-		node, err := app.Store.GetNode(nodeID)
-		if err != nil || node.Protocol != "peer" || strings.TrimSpace(node.Address) == "" {
-			return ""
-		}
-		return "http://" + net.JoinHostPort(node.Address, strconv.Itoa(peer.DefaultPort))
-	}
+	// HTTP 文件面：反向接入节点用注册上报的地址，同网段只靠广播互见的节点用广播地址，
+	// 都直接打对端 mesh 端口（大文件不走 SFTP-over-WS 通道）。
+	fileService.PeerHTTPBase = func(nodeID string) string { return app.meshBaseDirect(nodeID) }
 	// 跨域兜底：经持有上级代理拨到节点自己的 mesh 端口，HTTP 文件面照样可用。
 	fileService.RelayDial = func(ctx context.Context, id string) (net.Conn, error) {
 		return app.dialNodeMesh(ctx, id)
@@ -463,6 +467,42 @@ func intSetting(raw string, fallback int) int {
 	return value
 }
 
+// meshBaseDirect 返回节点自己 mesh HTTP 端口的直连基址。
+// 反向接入节点用注册上报的地址；同网段只靠广播互见的节点没有握手注册，
+// 用广播里的地址直接访问它的 /api/file/* 与 /api/exec；跨域节点不在直连视图里返回空。
+func (s *Service) meshBaseDirect(nodeID string) string {
+	if node, err := s.Store.GetNode(nodeID); err == nil {
+		// 反向接入节点用注册地址；mDNS 只看到、没注册的节点也能用它的广播地址，
+		// 端口优先取它自报的 peer_port（默认 56701 只是兜底）。
+		if node.Protocol != "peer" && !node.Discovered {
+			return ""
+		}
+		if strings.TrimSpace(node.Address) == "" {
+			return ""
+		}
+		return meshBaseURL(node.Address, node.PeerPort, node.Port)
+	}
+	if s.Discovery == nil {
+		return ""
+	}
+	if node, ok := s.Discovery.Find(nodeID); ok && strings.TrimSpace(node.Address) != "" {
+		return meshBaseURL(node.Address, node.PeerPort, node.Port)
+	}
+	return ""
+}
+
+// meshBaseURL 拼节点的 mesh 基址，端口按 peer_port → port → 默认端口 依次兜底。
+func meshBaseURL(address string, peerPort, port int) string {
+	switch {
+	case peerPort > 0:
+		port = peerPort
+	case port > 0:
+	default:
+		port = peer.DefaultPort
+	}
+	return "http://" + net.JoinHostPort(address, strconv.Itoa(port))
+}
+
 // isPeerNode 判断目标是否为反向接入节点（连接由它主动建立）。
 // 主表没有时再查完整拓扑：跨域节点（挂在别的上级下）只出现在拓扑里，
 // 它们同样走 peer 通道（直连失败自动经持有上级代理）。
@@ -489,20 +529,40 @@ func (s *Service) isPeerNode(nodeID string) bool {
 // execViaNodeMesh 在跨域节点的 mesh 端口上执行命令：拨到 127.0.0.1:56701 后
 // POST /api/exec（节点 HTTP 面，与文件传输同一条代理通道）。
 func (s *Service) execViaNodeMesh(ctx context.Context, nodeID, command string, timeout time.Duration) (model.ExecResult, error) {
-	result := model.ExecResult{}
 	conn, err := s.dialNodeMesh(ctx, nodeID)
 	if err != nil {
-		return result, err
+		return model.ExecResult{}, err
 	}
-	client := &http.Client{
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-			MaxConnsPerHost:   1,
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return conn, nil
-			},
+	return s.execWithConn(ctx, conn, command, timeout)
+}
+
+// execOverBase 直接对节点的 mesh HTTP 端口执行命令（同网段发现节点与反向接入节点）。
+func (s *Service) execOverBase(ctx context.Context, base, command string, timeout time.Duration) (model.ExecResult, error) {
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		MaxConnsPerHost:   1,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, strings.TrimPrefix(strings.TrimPrefix(base, "http://"), "https://"))
 		},
 	}
+	return s.execWithTransport(ctx, transport, "http://mesh", command, timeout)
+}
+
+func (s *Service) execWithConn(ctx context.Context, conn net.Conn, command string, timeout time.Duration) (model.ExecResult, error) {
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		MaxConnsPerHost:   1,
+		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return conn, nil
+		},
+	}
+	return s.execWithTransport(ctx, transport, "http://mesh", command, timeout)
+}
+
+func (s *Service) execWithTransport(ctx context.Context, transport *http.Transport, url, command string, timeout time.Duration) (model.ExecResult, error) {
+	result := model.ExecResult{}
+	client := &http.Client{Transport: transport}
 	defer client.CloseIdleConnections()
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -510,7 +570,7 @@ func (s *Service) execViaNodeMesh(ctx context.Context, nodeID, command string, t
 	ctx, cancel := context.WithTimeout(ctx, timeout+15*time.Second)
 	defer cancel()
 	payload, _ := json.Marshal(map[string]any{"command": command, "timeout_ms": timeout.Milliseconds()})
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://mesh/api/exec", bytes.NewReader(payload))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(url, "/")+"/api/exec", bytes.NewReader(payload))
 	if err != nil {
 		return result, err
 	}
@@ -988,11 +1048,19 @@ func (s *Service) Exec(ctx context.Context, nodeID, command string, timeout time
 		return model.ExecResult{}, apperrors.New(apperrors.InvalidArgument, "command is required")
 	}
 	started := time.Now()
-	if s.isPeerNode(nodeID) {
+	base := s.meshBaseDirect(nodeID)
+	if s.isPeerNode(nodeID) || base != "" {
 		result, err := s.Peer.Exec(ctx, nodeID, command, timeout)
 		if err == nil {
 			s.Audit.Record(ctx, "peer.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command}), started, nil)
 			return result, nil
+		}
+		// 同网段/反向接入：直连它的 mesh 端口走 HTTP exec。
+		if base != "" {
+			if directResult, directErr := s.execOverBase(ctx, base, command, timeout); directErr == nil {
+				s.Audit.Record(ctx, "peer.exec", nodeID, policy.CapSSH, audit.SafeParameters(map[string]string{"command": command, "via": "mesh-http"}), started, nil)
+				return directResult, nil
+			}
 		}
 		// 跨域节点不在本机链路上：经持有上级代理拨它的 mesh 端口走 HTTP exec。
 		if relayResult, relayErr := s.execViaNodeMesh(ctx, nodeID, command, timeout); relayErr == nil {
