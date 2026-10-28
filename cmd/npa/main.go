@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/npa/npa/internal/console"
 	"github.com/npa/npa/internal/mcp"
 	"github.com/npa/npa/internal/service"
 	"github.com/npa/npa/internal/state"
@@ -127,12 +126,6 @@ func main() {
 	if err != nil {
 		slog.Error("cannot open state database", "error", err)
 		os.Exit(1)
-	}
-	// 是否隐藏控制台以标记文件为准（与 run.sh / run.bat 的判断完全一致）：
-	// 删掉 <数据目录>/hide_console 就能离线恢复成可见的前台模式，无需改数据库。
-	if _, markerErr := os.Stat(service.HideConsoleMarkerPath(dataDirPath(*dataDir))); markerErr == nil && console.Hide() {
-		slog.Info("控制台已隐藏，输出只写文件；删掉 hide_console 标记即可恢复，或用 Web 设置页的「退出服务」结束进程",
-			"log", filepath.Join(dataDirPath(*dataDir), "npa.log"))
 	}
 	app := service.New(store)
 	mcpManager := mcp.NewManager(app)

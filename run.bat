@@ -1,10 +1,13 @@
 @echo off
 rem NPA launcher (Windows)
 rem
-rem Default: run in this console, output goes to the console and to the log file.
-rem If the hide_console marker exists (enabled in Web settings), NPA is started
-rem detached in a hidden window: output goes to the log file only, and this
-rem console can be closed right after startup.
+rem Default: run in this console, output goes to the console and to the log file
+rem (foreground mode, for debugging). If the hide_console marker exists (enabled
+rem in Web settings), NPA is started detached with a HIDDEN window: output goes
+rem to the log file only, and this console can be closed right after startup.
+rem The NPA binary itself never touches the console/window API — hiding is done
+rem entirely here in the launcher, so foreground/background is a launch-time
+rem concern only.
 rem
 rem Usage: run.bat [--data-dir DIR] [--log-level LEVEL]
 
@@ -39,11 +42,13 @@ set LOG=%DATA_DIR%\npa.log
 
 if exist "%MARKER%" (
   if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
-  rem start /min: launches NPA with its own console, decoupled from this one
-  rem (closing this window does not kill NPA). NPA then hides that window
-  rem itself when the hide_console setting is on.
-  start "" /min "%BIN%" %*
-  echo NPA started in background; you can close this console.
+  rem 后台异步：NPA 是控制台程序，用 PowerShell 以隐藏窗口方式拉起（关闭本控制台
+  rem 不影响 NPA 进程），输出只进日志文件。Go 侧不做任何窗口操作，前台/后台完全
+  rem 由本脚本按 hide_console 标记决定。
+  set "NPA_BIN=%BIN%"
+  set "NPA_ARGS=%*"
+  start "" powershell.exe -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath $env:NPA_BIN -ArgumentList $env:NPA_ARGS -WindowStyle Hidden"
+  echo NPA started in background (hidden window); you can close this console.
   echo Log: %LOG%
   echo Web: http://127.0.0.1:56700
   exit /b 0
