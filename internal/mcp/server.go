@@ -13,6 +13,7 @@ import (
 	apperrors "github.com/npa/npa/internal/errors"
 	"github.com/npa/npa/internal/model"
 	"github.com/npa/npa/internal/policy"
+	"github.com/npa/npa/internal/selfupdate"
 	"github.com/npa/npa/internal/service"
 )
 
@@ -44,6 +45,7 @@ func (m *Manager) Refresh() {
 		"tunnel.list", "tunnel.open", "tunnel.close", "service.open_web",
 		"desktop.screens", "desktop.screenshot", "desktop.mouse_move", "desktop.mouse_click", "desktop.mouse_scroll",
 		"discovery.nodes", "discovery.refresh", "network.subnets", "relay.routes", "relay.open",
+		"upgrade.guide",
 	)
 	mcpCtx := func(ctx context.Context) context.Context { return policy.WithSource(ctx, policy.SourceMCP) }
 	mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "nodes.list", Description: "List managed nodes"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
@@ -268,6 +270,12 @@ func (m *Manager) Refresh() {
 			return nil, route, nil
 		})
 	}
+
+	// upgrade.guide：远程升级手册。不受能力开关限制——其它 AI 程序连上
+	// 任意节点的 MCP 就能读到升级流程与坑，不需要翻仓库文档。
+	mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "upgrade.guide", Description: "Full runbook for remotely upgrading NPA nodes (guardian mode): steps, endpoints and known pitfalls"}, func(_ context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+		return nil, map[string]any{"runbook": selfupdate.Guide(), "version": service.Version}, nil
+	})
 }
 
 func (m *Manager) Handler() http.Handler {
