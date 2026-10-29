@@ -50,9 +50,10 @@ AI (MCP) ──► Mesh 入口 :56701  ─┬─ /mcp（MCP Streamable HTTP）
 ### AI 集成
 - ✅ **MCP Server**（Streamable HTTP，`:56701/mcp`）：`nodes.list`、`ssh.exec`、`file.*`、`tunnel.*`、`desktop.*`、`discovery.*`、`network.subnets`、`relay.*`、`upgrade.guide` 等 20+ 工具，能力位开关独立控制
 - ✅ AI 程序可通过 MCP 组合完成全自动的「发现节点→部署→升级→验证」闭环
-
 ## 规划中的功能 📋
 
+- 📋 **远程桌面控制**：查看/控制远程节点的桌面（现有 `desktop.*` 仅支持本机；需 peer 节点桌面采集与输入注入通道）
+- 📋 **远程截图**：截取远程节点屏幕画面（同上，经反向通道回传 PNG）
 - 📋 **分域 v2 完整版**：域管理者选举、心跳判死、epoch/seq 增量同步核心已落地（`internal/peer/domain.go`，含单测）；待补主动探测图、真实多进程端到端测试
 - 📋 **数据面健壮性**：通道池用后归还、数据连接 keepalive（NAT 静默断流防护）
 - 📋 **权限体系重新设计**：当前为稳定性优先已搁置——文件面/exec 暂无鉴权，仅建议内网使用；稳定后整体重做

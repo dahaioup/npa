@@ -53,6 +53,8 @@ Upgrade ──► guardian process (backup/watchdog/restart/rollback/self-cleanu
 
 ## Planned Features 📋
 
+- 📋 **Remote desktop control**: view/control a remote node's desktop (existing `desktop.*` tools are local-only; needs desktop capture + input injection channels over the peer link)
+- 📋 **Remote screenshot**: capture a remote node's screen (same; PNG streamed back over the reverse channel)
 - 📋 **Domain mesh v2 (full)**: domain manager election, heartbeat liveness, and epoch/seq incremental sync core are landed (`internal/peer/domain.go`, unit-tested); remaining: active probing graph, real multi-process e2e tests
 - 📋 **Data-plane robustness**: channel pool reuse after use, data-connection keepalive (NAT silent-drop protection)
 - 📋 **Permission system redesign**: deliberately deferred for stability — the file/exec plane currently has no authentication; intranet use recommended until redesigned
