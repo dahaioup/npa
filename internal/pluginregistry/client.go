@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// DefaultRegistryURL points at the public NPA plugin repository hosted on the
-// community Gitea instance.
-const DefaultRegistryURL = "http://gitea.example.com/npa-plugins/raw/branch/main/registry.json"
+// DefaultRegistryURL points at the public NPA plugin repository hosted on
+// GitHub.
+const DefaultRegistryURL = "https://github.com/dahaioup/npa-plugins/raw/main/registry.json"
 
 // downloadAttempts is the number of times a broken download is retried before
 // the installer gives up.
