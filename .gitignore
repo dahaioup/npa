@@ -1,0 +1,40 @@
+# ---> Go
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# 根目录下的 npa 可执行文件（锚定根路径，避免误伤 cmd/npa 源码目录）
+/npa
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# NPA local runtime state
+.npa/
+dist/
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# macOS
+.DS_Store
+npa-guardian-*.json
+npa.bak
+
+# 升级 guardian 留下的旧二进制备份
+*.old-*

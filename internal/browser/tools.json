@@ -1,0 +1,683 @@
+[
+  {
+    "name": "browser_navigate",
+    "description": "Navigate to a URL and wait for the page to load",
+    "input_schema": {
+      "properties": {
+        "url": {
+          "description": "URL to navigate to",
+          "type": "string"
+        },
+        "waitUntil": {
+          "description": "Navigation wait condition (default: load)",
+          "enum": [
+            "load",
+            "domcontentloaded",
+            "networkidle0"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_snapshot",
+    "description": "Get URL, title, actionable element references, control states, and visible body text",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_chars": {
+          "description": "Character budget shared by whole control descriptions and visible body text (default: 4000); URL and title are separately capped at 256 characters each",
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_click",
+    "description": "Click an element. Pass `ref` (preferred, from browser_snapshot / browser_interactive_elements) OR a `selector`.",
+    "input_schema": {
+      "properties": {
+        "ref": {
+          "description": "Element ref like 'e3' from a recent snapshot",
+          "type": "string"
+        },
+        "selector": {
+          "description": "CSS selector (fallback if ref unavailable)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_fill",
+    "description": "Set the value of an input element. Pass `ref` (preferred) OR `selector`.",
+    "input_schema": {
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        },
+        "value": {
+          "description": "Value to set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_type",
+    "description": "Type text into an input element (appends to existing value). Pass `ref` (preferred) OR `selector`.",
+    "input_schema": {
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        },
+        "text": {
+          "description": "Text to type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_press_key",
+    "description": "Dispatch a keyboard event on an element or the document",
+    "input_schema": {
+      "properties": {
+        "key": {
+          "description": "Key name (e.g. Enter, Tab, Escape)",
+          "type": "string"
+        },
+        "selector": {
+          "description": "CSS selector (optional, defaults to document)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_select_option",
+    "description": "Select an option from a \u003cselect\u003e element",
+    "input_schema": {
+      "properties": {
+        "selector": {
+          "description": "CSS selector of the \u003cselect\u003e element",
+          "type": "string"
+        },
+        "value": {
+          "description": "Value or text of the option to select",
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector",
+        "value"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_evaluate",
+    "description": "Evaluate a JavaScript expression in the page context and return the result",
+    "input_schema": {
+      "properties": {
+        "expression": {
+          "description": "JavaScript expression to evaluate; a promise it returns is awaited",
+          "type": "string"
+        },
+        "timeoutMs": {
+          "description": "How long to wait for a returned promise, in milliseconds (default: 5000)",
+          "type": "number"
+        }
+      },
+      "required": [
+        "expression"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_wait_for_function",
+    "description": "Wait until a JavaScript expression returns true, polling the page",
+    "input_schema": {
+      "properties": {
+        "function": {
+          "description": "JavaScript expression that must become truthy",
+          "type": "string"
+        },
+        "pollIntervalMs": {
+          "description": "Poll interval in milliseconds (default: 100)",
+          "type": "number"
+        },
+        "timeout": {
+          "description": "Timeout in milliseconds (default: 30000)",
+          "type": "number"
+        }
+      },
+      "required": [
+        "function"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_wait_for",
+    "description": "Wait for a CSS selector to appear in the DOM",
+    "input_schema": {
+      "properties": {
+        "selector": {
+          "description": "CSS selector to wait for",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in seconds (default: 30)",
+          "type": "number"
+        }
+      },
+      "required": [
+        "selector"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_network_requests",
+    "description": "Return the list of network requests made by the current page",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_console_messages",
+    "description": "Return the console messages logged by the current page",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_close",
+    "description": "Close the current browser page and reset state",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_markdown",
+    "description": "Extract the current page as Markdown (headings, paragraphs, lists, links, code blocks). Use this instead of browser_snapshot when you want token-dense structured content rather than plain text.",
+    "input_schema": {
+      "properties": {
+        "max_chars": {
+          "description": "Truncate to this many characters (default 4000)",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_links",
+    "description": "List every anchor link on the current page as one JSON object per line: {text, href}. Use when you need to enumerate where to navigate next.",
+    "input_schema": {
+      "properties": {
+        "internal_only": {
+          "description": "If true, only return links on the same origin as the current page",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max number of links to return (default 100)",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_interactive_elements",
+    "description": "List every clickable / typeable element on the current page with a stable ref ID and a brief description. Use this BEFORE clicking or filling so you can refer to elements by ref instead of guessing a CSS selector. Refs look like 'e3' and stay valid until the next navigation.",
+    "input_schema": {
+      "properties": {
+        "limit": {
+          "description": "Max number of elements (default 100)",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_back",
+    "description": "Navigate back in the page history (equivalent to the browser back button).",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_forward",
+    "description": "Navigate forward in the page history.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_reload",
+    "description": "Reload the current page.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_get_cookies",
+    "description": "Return all cookies in the browser's cookie jar as one JSON object per line.",
+    "input_schema": {
+      "properties": {
+        "domain": {
+          "description": "Filter to cookies on this domain (default: all)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_set_cookie",
+    "description": "Add or replace a cookie in the jar. Use this to skip a login flow when you already have a session token.",
+    "input_schema": {
+      "properties": {
+        "domain": {
+          "description": "e.g. example.com or .example.com",
+          "type": "string"
+        },
+        "http_only": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "description": "default '/'",
+          "type": "string"
+        },
+        "secure": {
+          "type": "boolean"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value",
+        "domain"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_clear_cookies",
+    "description": "Wipe every cookie from the jar.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_wait_for_text",
+    "description": "Wait until a substring appears anywhere in the rendered page text. Use when you want to wait for a result message or notification rather than a specific selector.",
+    "input_schema": {
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Seconds (default 30)",
+          "type": "number"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_detect_forms",
+    "description": "List every \u003cform\u003e on the page with its action URL, method, and a description of each input/textarea/select. Use to understand a form's structure before filling it in.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_fill_form",
+    "description": "Fill multiple inputs in one call. `fields` is an array of {ref?, selector?, value, type?}. type='text' (default) sets value, type='check'/'uncheck' toggles checkboxes, type='select' picks an option by value or visible text. Saves N round-trips vs N browser_fill calls.",
+    "input_schema": {
+      "properties": {
+        "fields": {
+          "items": {
+            "properties": {
+              "ref": {
+                "type": "string"
+              },
+              "selector": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "text",
+                  "check",
+                  "uncheck",
+                  "select"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "submit_ref": {
+          "description": "Optional: click this element after filling (e.g. submit button ref)",
+          "type": "string"
+        },
+        "submit_selector": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fields"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_scroll",
+    "description": "Scroll the page or an element. `direction` is 'top'|'bottom'|'up'|'down'|'left'|'right' (default 'down'). `amount` in pixels (default viewport height). Use 'bottom' to trigger infinite-scroll loaders.",
+    "input_schema": {
+      "properties": {
+        "amount": {
+          "description": "Pixels (default: one viewport)",
+          "type": "number"
+        },
+        "direction": {
+          "enum": [
+            "top",
+            "bottom",
+            "up",
+            "down",
+            "left",
+            "right"
+          ],
+          "type": "string"
+        },
+        "ref": {
+          "description": "Optional element to scroll into view",
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_get_attribute",
+    "description": "Read an attribute of an element (href, src, value, class, data-*, etc.). Returns the raw attribute value as a string, or empty string if missing.",
+    "input_schema": {
+      "properties": {
+        "attribute": {
+          "description": "Attribute name (e.g. href, value, src)",
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attribute"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_count",
+    "description": "Count how many elements on the page match a CSS selector. Cheap existence / pagination probe.",
+    "input_schema": {
+      "properties": {
+        "selector": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_extract",
+    "description": "Extract a structured object from the page given a map of {field_name: css_selector}. Returns one JSON object with each field set to the matching element's text content (or attribute via 'selector@attr' syntax, e.g. 'a@href'). For list extraction, append '[]' to the field name (e.g. 'rows[]') and the value will be an array.",
+    "input_schema": {
+      "properties": {
+        "schema": {
+          "description": "Map of field_name to CSS selector. Suffix selector with '@attr' for attribute, suffix field name with '[]' for array.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_tab_new",
+    "description": "Open a new tab (isolated browser page). Returns the tab ID; subsequent tool calls operate on the most recently opened or browser_tab_switch'd tab.",
+    "input_schema": {
+      "properties": {
+        "url": {
+          "description": "Optional URL to navigate the new tab to",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_tab_list",
+    "description": "List all open tabs with their ID, URL, title, and which one is active.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_tab_switch",
+    "description": "Switch the active tab. All subsequent tool calls (snapshot, click, etc.) target this tab.",
+    "input_schema": {
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_tab_close",
+    "description": "Close a tab by ID (default: the active tab). If you close the active tab, the next remaining tab becomes active.",
+    "input_schema": {
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_search",
+    "description": "Find substring matches in the visible page text. Returns each match with its surrounding context. Use this to confirm content exists before scraping or to locate a section.",
+    "input_schema": {
+      "properties": {
+        "case_sensitive": {
+          "type": "boolean"
+        },
+        "context_chars": {
+          "description": "Chars on each side of the match (default 80)",
+          "type": "number"
+        },
+        "limit": {
+          "description": "Max matches to return (default 10)",
+          "type": "number"
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_storage_state",
+    "description": "Export the full authentication / session state (cookies + localStorage + sessionStorage) as a JSON object. Save this to skip a login on a subsequent run via browser_set_storage_state.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_set_storage_state",
+    "description": "Restore session state previously returned by browser_storage_state. Pass the JSON object. Use to bring an authenticated session back without re-logging in.",
+    "input_schema": {
+      "properties": {
+        "state": {
+          "description": "{cookies: [...], origins: [{origin, localStorage: [...], sessionStorage: [...]}]}",
+          "type": "object"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_screenshot",
+    "description": "Capture the current rendered viewport as a PNG image. Width and height default to the page's current CSS viewport.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "height": {
+          "description": "Optional CSS-pixel capture height",
+          "exclusiveMinimum": 0,
+          "maximum": 32768,
+          "type": "number"
+        },
+        "width": {
+          "description": "Optional CSS-pixel capture width",
+          "exclusiveMinimum": 0,
+          "maximum": 32768,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "browser_pdf",
+    "description": "Export the current rendered document as a paginated raster PDF using print media and bounded PDF defaults.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "landscape": {
+          "type": "boolean"
+        },
+        "margin_bottom": {
+          "description": "Bottom margin in inches",
+          "minimum": 0,
+          "type": "number"
+        },
+        "margin_left": {
+          "description": "Left margin in inches",
+          "minimum": 0,
+          "type": "number"
+        },
+        "margin_right": {
+          "description": "Right margin in inches",
+          "minimum": 0,
+          "type": "number"
+        },
+        "margin_top": {
+          "description": "Top margin in inches",
+          "minimum": 0,
+          "type": "number"
+        },
+        "paper_height": {
+          "description": "Paper height in inches",
+          "exclusiveMinimum": 0,
+          "maximum": 200,
+          "type": "number"
+        },
+        "paper_width": {
+          "description": "Paper width in inches",
+          "exclusiveMinimum": 0,
+          "maximum": 200,
+          "type": "number"
+        },
+        "print_background": {
+          "type": "boolean"
+        },
+        "scale": {
+          "maximum": 2,
+          "minimum": 0.1,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  }
+]

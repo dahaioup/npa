@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NPA 文件分发</title>
+<style>
+:root{--bg:#0b1220;--panel:#121c31;--line:#22345a;--text:#dbe6ff;--muted:#8fa3cc;--accent:#3d8bfd;--danger:#e05561;--ok:#3fbf7f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:16px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{margin:0;font-size:18px}
+header .tag{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+main{padding:18px 22px;max-width:1180px;margin:0 auto}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
+label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
+select,input[type=text]{background:#0e1730;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 10px;font-size:13px;min-width:180px}
+input[type=text]#path{flex:1;min-width:260px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+button{background:#1b2947;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{color:#ffd7da;border-color:#5b2b33}
+button.link{background:none;border:none;color:var(--accent);padding:2px 6px}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--muted);font-weight:600;background:#101a2e}
+tr:last-child td{border-bottom:none}
+td.name a{color:var(--text);text-decoration:none}
+td.name a:hover{color:var(--accent)}
+td.muted{color:var(--muted)}
+.empty{padding:36px;text-align:center;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.notice{padding:9px 12px;background:#172744;border:1px solid #304774;border-radius:8px;color:#b9c9ec;margin-bottom:14px;font-size:13px}
+footer{padding:14px 22px;color:var(--muted);font-size:12px;text-align:center}
+#err{color:#ffb3b8;margin-left:auto}
+</style>
+</head>
+<body>
+<header>
+  <h1>NPA 文件分发</h1>
+  <span class="tag" id="port">内置插件</span>
+  <span class="tag" id="self"></span>
+</header>
+<main>
+  <div class="notice" id="hint">文件分发由 NPA 内置插件提供：本页可直接浏览本机文件；选择其它节点时由插件转发到该节点的文件面。</div>
+  <div class="toolbar">
+    <label>节点 <select id="node"></select></label>
+    <input type="text" id="path" value="/">
+    <button class="primary" id="refresh">刷新</button>
+    <button id="mkdir">新建目录</button>
+    <button id="upload">上传文件</button>
+    <input id="file" type="file" hidden>
+    <span id="err"></span>
+  </div>
+  <div id="list"></div>
+</main>
+<footer>NPA 文件插件 · 节点文件面与页面同端口</footer>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtSize = (n) => {
+  if (n === undefined || n === null) return '—';
+  const units = ['B','KB','MB','GB','TB'];
+  let v = Number(n), i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+};
+const fmtTime = (sec) => {
+  if (!sec) return '—';
+  const d = new Date(sec * 1000);
+  return d.toLocaleString();
+};
+let nodes = [];
+
+async function api(url, options) {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  let payload = null;
+  try { payload = text ? JSON.parse(text) : null; } catch (e) { payload = text; }
+  if (!res.ok) throw new Error((payload && payload.message) || (typeof payload === 'string' ? payload : ('HTTP ' + res.status)));
+  return payload;
+}
+
+function currentNode() { return $('#node').value; }
+function currentPath() { return $('#path').value || '/'; }
+
+async function loadNodes() {
+  try {
+    nodes = await api('/api/nodes');
+  } catch (e) {
+    nodes = [];
+  }
+  const sel = $('#node');
+  const previous = sel.value;
+  sel.innerHTML = (nodes || []).map((n) => `<option value="${esc(n.id)}">${esc(n.name)}${n.address ? ' · ' + esc(n.address) : ''}</option>`).join('');
+  if (previous && (nodes || []).some((n) => n.id === previous)) sel.value = previous;
+}
+
+async function loadHealth() {
+  try {
+    const info = await api('/api/health');
+    if (info && info.port) $('#port').textContent = '插件端口 ' + info.port;
+    if (info && info.self) $('#self').textContent = '本机 ' + info.self;
+  } catch (e) { /* 页面可离线使用 */ }
+}
+
+async function refresh() {
+  const err = $('#err');
+  err.textContent = '';
+  const node = currentNode();
+  const path = currentPath();
+  const list = $('#list');
+  list.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const query = new URLSearchParams({ path });
+    if (node) query.set('node', node);
+    const entries = await api('/api/file/list?' + query.toString());
+    if (!entries || !entries.length) {
+      list.innerHTML = '<div class="empty">目录为空</div>';
+      return;
+    }
+    list.innerHTML = `<table><thead><tr><th>名称</th><th>大小</th><th>权限</th><th>修改时间</th><th style="width:220px">操作</th></tr></thead><tbody>${
+      entries.map((e) => `<tr>
+        <td class="name">${e.is_dir ? '📁' : '📄'} <a href="#" data-path="${esc(e.path)}">${esc(e.name)}</a></td>
+        <td class="muted">${e.is_dir ? '—' : esc(fmtSize(e.size))}</td>
+        <td class="muted">${esc(e.mode)}</td>
+        <td class="muted">${esc(fmtTime(e.mod_time_unix))}</td>
+        <td>${e.is_dir ? '' : `<button class="link" data-download="${esc(e.path)}">下载</button> <button class="link" data-rename="${esc(e.path)}">重命名</button> <button class="link danger" data-remove="${esc(e.path)}">删除</button>`}</td>
+      </tr>`).join('')}</tbody></table>`;
+    list.querySelectorAll('a[data-path]').forEach((a) => a.onclick = (ev) => {
+      ev.preventDefault();
+      $('#path').value = a.dataset.path;
+      refresh();
+    });
+    list.querySelectorAll('[data-download]').forEach((b) => b.onclick = () => {
+      const query = new URLSearchParams({ path: b.dataset.download });
+      if (node) query.set('node', node);
+      window.open('/api/file/download?' + query.toString(), '_blank');
+    });
+    list.querySelectorAll('[data-rename]').forEach((b) => b.onclick = async () => {
+      const from = b.dataset.rename;
+      const to = prompt('重命名为', from);
+      if (!to || to === from) return;
+      try {
+        await api('/api/file/rename?' + params({ from, to }), { method: 'POST' });
+        refresh();
+      } catch (err) { $('#err').textContent = err.message; }
+    });
+    list.querySelectorAll('[data-remove]').forEach((b) => b.onclick = async () => {
+      if (!confirm('确认删除 ' + b.dataset.remove + ' ?')) return;
+      try {
+        await api('/api/file/remove?' + params({ path: b.dataset.remove }), { method: 'POST' });
+        refresh();
+      } catch (err) { $('#err').textContent = err.message; }
+    });
+  } catch (err) {
+    list.innerHTML = '<div class="empty">加载失败</div>';
+    $('#err').textContent = err.message;
+  }
+}
+
+function params(extra) {
+  const query = new URLSearchParams(extra || {});
+  const node = currentNode();
+  if (node) query.set('node', node);
+  return query.toString();
+}
+
+$('#refresh').onclick = refresh;
+$('#node').onchange = refresh;
+$('#path').onkeydown = (ev) => { if (ev.key === 'Enter') refresh(); };
+$('#mkdir').onclick = async () => {
+  const dir = prompt('新建目录路径（相对当前目录时用 . 开头）');
+  if (!dir) return;
+  const target = dir.startsWith('/') ? dir : joinPath(currentPath(), dir);
+  try {
+    await api('/api/file/mkdir?' + params({ path: target }), { method: 'POST' });
+    refresh();
+  } catch (err) { $('#err').textContent = err.message; }
+};
+$('#upload').onclick = () => $('#file').click();
+$('#file').onchange = async () => {
+  const f = $('#file').files[0];
+  if (!f) return;
+  try {
+    await api('/api/file/upload?' + params({ path: joinPath(currentPath(), f.name) }), { method: 'PUT', body: f });
+    refresh();
+  } catch (err) { $('#err').textContent = err.message; }
+  $('#file').value = '';
+};
+
+function joinPath(base, name) {
+  const b = (base || '/').replace(/\/+$/, '');
+  return (b + '/' + name).replace(/\/{2,}/g, '/');
+}
+
+loadNodes().then(loadHealth).then(refresh);
+</script>
+</body>
+</html>

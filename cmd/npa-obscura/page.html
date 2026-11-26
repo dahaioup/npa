@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>obscura 无头浏览器</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --line: #e3e6ea;
+    --text: #1d2129;
+    --muted: #6b7280;
+    --accent: #2f6feb;
+    --danger: #d93026;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111316; --card:#1a1d21; --line:#2b2f35; --text:#e6e8ea; --muted:#9aa3ad; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 20px 48px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 22px; font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 12px; letter-spacing: .02em; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1 1 260px; }
+  input[type=text], input[type=url], select {
+    width: 100%; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  button {
+    padding: 7px 14px; border-radius: 7px; border: 1px solid transparent;
+    background: var(--accent); color: #fff; font: inherit; cursor: pointer;
+  }
+  button.ghost { background: transparent; border-color: var(--line); color: var(--text); }
+  button:disabled { opacity: .55; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 5px 0; vertical-align: top; }
+  td.k { color: var(--muted); width: 120px; }
+  td.v { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 12px; border: 1px solid var(--line); }
+  .tag.on { color: #16794c; border-color: #16794c; }
+  .tag.off { color: var(--danger); border-color: var(--danger); }
+  .msg { margin-top: 10px; font-size: 13px; color: var(--muted); white-space: pre-wrap; }
+  .msg.err { color: var(--danger); }
+  .shot { margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: none; }
+  .shot img { display: block; width: 100%; }
+  code { background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>obscura 无头浏览器</h1>
+  <p class="sub">NPA 浏览器插件的管理页：安装/更新 obscura 引擎、预览网页。这个页面由插件自己提供，只监听本机。</p>
+
+  <div class="card">
+    <h2>引擎状态</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="ghost" id="refresh">刷新状态</button>
+    </div>
+    <table>
+      <tr><td class="k">引擎</td><td class="v" id="engine">—</td></tr>
+      <tr><td class="k">安装状态</td><td class="v"><span class="tag" id="installed">—</span></td></tr>
+      <tr><td class="k">版本</td><td class="v" id="version">—</td></tr>
+      <tr><td class="k">形态</td><td class="v" id="variant">—</td></tr>
+      <tr><td class="k">可执行文件</td><td class="v" id="path">—</td></tr>
+      <tr><td class="k">工具数量</td><td class="v" id="tools">—</td></tr>
+      <tr><td class="k">HTTP 监听</td><td class="v" id="listen">—</td></tr>
+      <tr><td class="k">MCP 端点</td><td class="v" id="mcp">—</td></tr>
+    </table>
+    <div class="msg" id="statusMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>安装 / 更新 obscura</h2>
+    <div class="row">
+      <select class="grow" id="variantSelect">
+        <option value="">默认（含渲染）</option>
+        <option value="stealth">stealth（渲染 + 隐匿）</option>
+        <option value="no-render">no-render（不渲染，更小更快）</option>
+      </select>
+      <button id="install">下载安装</button>
+    </div>
+    <div class="msg" id="installMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>页面预览</h2>
+    <div class="row">
+      <input class="grow" type="url" id="url" placeholder="https://example.com" value="https://example.com">
+      <button id="preview">抓取预览</button>
+    </div>
+    <div class="msg" id="previewMsg"></div>
+    <div class="shot" id="shot"><img id="shotImg" alt="页面截图"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var status = {};
+
+  function text(id, value) { $(id).textContent = (value === undefined || value === null || value === '') ? '—' : String(value); }
+
+  function showError(id, message) {
+    var el = $(id);
+    el.className = 'msg err';
+    el.textContent = message || '出错了';
+  }
+
+  function loadStatus() {
+    return fetch('/api/status').then(function (r) { return r.json(); }).then(function (data) {
+      status = data || {};
+      text('engine', status.engine);
+      var tag = $('installed');
+      tag.textContent = status.installed ? '已安装' : '未安装';
+      tag.className = 'tag ' + (status.installed ? 'on' : 'off');
+      text('version', status.version);
+      text('variant', status.variant || '默认');
+      text('path', status.path);
+      text('tools', status.tools);
+      text('listen', status.bind ? status.bind + ':' + status.port : '—');
+      text('mcp', (status.mcp_path || '/mcp') + '  ·  NPA 代理：' + (status.proxy_path || '/plugins/browser/mcp'));
+      if (status.variant) { $('variantSelect').value = status.variant; }
+      var msg = $('statusMsg');
+      msg.className = 'msg';
+      msg.textContent = status.installing ? '正在安装…' : (status.last_error ? '上次错误：' + status.last_error : '');
+    }).catch(function (err) {
+      showError('statusMsg', '读状态失败：' + err);
+    });
+  }
+
+  $('refresh').addEventListener('click', loadStatus);
+
+  $('install').addEventListener('click', function () {
+    var button = $('install');
+    button.disabled = true;
+    var msg = $('installMsg');
+    msg.className = 'msg';
+    msg.textContent = '正在下载安装（大约 40–70MB，请稍候）…';
+    fetch('/api/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ variant: $('variantSelect').value })
+    }).then(function (r) {
+      return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+    }).then(function (result) {
+      if (!result.ok) {
+        showError('installMsg', result.data && result.data.error ? result.data.error : '安装失败');
+        return;
+      }
+      msg.className = 'msg';
+      msg.textContent = '安装完成：' + result.data.version + '（' + result.data.asset + '）';
+      loadStatus();
+    }).catch(function (err) {
+      showError('installMsg', '安装失败：' + err);
+    }).finally(function () {
+      button.disabled = false;
+    });
+  });
+
+  $('preview').addEventListener('click', function () {
+    var url = $('url').value.trim();
+    if (!url) { showError('previewMsg', '先填一个网址'); return; }
+    var msg = $('previewMsg');
+    msg.className = 'msg';
+    msg.textContent = '抓取中…';
+    $('shot').style.display = 'none';
+    fetch('/api/preview?url=' + encodeURIComponent(url))
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().then(function (data) { throw new Error(data && data.error ? data.error : ('HTTP ' + r.status)); });
+        }
+        return r.blob();
+      })
+      .then(function (blob) {
+        msg.className = 'msg';
+        msg.textContent = '抓取完成：' + url;
+        var img = $('shotImg');
+        if (img.dataset.objectUrl) { URL.revokeObjectURL(img.dataset.objectUrl); }
+        var objectUrl = URL.createObjectURL(blob);
+        img.dataset.objectUrl = objectUrl;
+        img.src = objectUrl;
+        $('shot').style.display = 'block';
+      })
+      .catch(function (err) {
+        showError('previewMsg', '抓取失败：' + err);
+      });
+  });
+
+  loadStatus();
+})();
+</script>
+</body>
+</html>
