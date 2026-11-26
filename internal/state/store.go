@@ -31,6 +31,7 @@ var (
 	discoveredBucket   = []byte("discovered_nodes")
 	relayBucket        = []byte("relay_routes")
 	portMappingsBucket = []byte("port_mappings")
+	channelsBucket     = []byte("channels")
 	metaBucket         = []byte("meta")
 	auditSeqKey        = []byte("audit_sequence")
 	nodeIDKey          = []byte("local_node_id")
@@ -73,7 +74,10 @@ func Open(dataDir string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := bolt.Open(filepath.Join(dataDir, "state.db"), 0o600, &bolt.Options{Timeout: 2 * time.Second})
+	// 超时给足：上一个实例收到停止信号后要做优雅关闭（web/mesh/插件都要收尾），
+	// 期间它仍持有 state.db 的排他锁；2 秒太短会让「紧接着重启」直接失败
+	// （症状：cannot open state database error=timeout）。
+	db, err := bolt.Open(filepath.Join(dataDir, "state.db"), 0o600, &bolt.Options{Timeout: 20 * time.Second})
 	if err != nil {
 		return nil, err
 	}
@@ -401,6 +405,69 @@ func decrypt(key []byte, nonceEncoded, dataEncoded string) ([]byte, error) {
 		return nil, err
 	}
 	return gcm.Open(nil, nonce, data, nil)
+}
+
+// ListChannels 返回统一通道登记表里的通道（S1 阶段 ssh/npa 通道是隧道与映射的投影，
+// 这里存放的是不经隧道/映射承载的通道记录，例如 S3 的临时隧道）。
+func (s *Store) ListChannels() ([]model.Channel, error) {
+	channels := []model.Channel{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(channelsBucket)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(_, value []byte) error {
+			var channel model.Channel
+			if err := json.Unmarshal(value, &channel); err != nil {
+				return err
+			}
+			channels = append(channels, channel)
+			return nil
+		})
+	})
+	sort.Slice(channels, func(i, j int) bool { return channels[i].ID < channels[j].ID })
+	return channels, err
+}
+
+// GetChannel 按统一通道 ID 取一条登记记录。
+func (s *Store) GetChannel(id string) (model.Channel, error) {
+	var channel model.Channel
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if !readJSON(tx.Bucket(channelsBucket), []byte(id), &channel) {
+			return apperrors.New(apperrors.InvalidArgument, "channel not found")
+		}
+		return nil
+	})
+	return channel, err
+}
+
+// SaveChannel 保存（或覆盖）一条通道登记记录。
+func (s *Store) SaveChannel(channel model.Channel) error {
+	if channel.ID == "" {
+		return apperrors.New(apperrors.InvalidArgument, "id is required")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(channelsBucket)
+		if err != nil {
+			return err
+		}
+		payload, err := json.Marshal(channel)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(channel.ID), payload)
+	})
+}
+
+// DeleteChannel 删除一条通道登记记录。
+func (s *Store) DeleteChannel(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(channelsBucket)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete([]byte(id))
+	})
 }
 
 func (s *Store) ListTunnels() ([]model.Tunnel, error) {

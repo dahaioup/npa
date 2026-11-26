@@ -121,16 +121,11 @@ func (s *Server) Handler() http.Handler {
 	// guardian 完成通知：杀 guardian 进程 + 删 guardian 文件 + 删 old- 备份
 	mux.HandleFunc("POST /api/guardian/complete", s.handleGuardianComplete)
 	mux.HandleFunc("GET /api/nodes/{id}/resources", s.handleNodeResources)
-	mux.HandleFunc("GET /api/tunnels", s.handleTunnels)
-	mux.HandleFunc("POST /api/tunnels", s.handleTunnelSave)
-	mux.HandleFunc("POST /api/tunnels/{id}/start", s.handleTunnelStart)
-	mux.HandleFunc("POST /api/tunnels/{id}/stop", s.handleTunnelStop)
-	mux.HandleFunc("DELETE /api/tunnels/{id}", s.handleTunnelDelete)
-	mux.HandleFunc("GET /api/portmappings", s.handlePortMappings)
-	mux.HandleFunc("POST /api/portmappings", s.handlePortMappingSave)
-	mux.HandleFunc("POST /api/portmappings/{id}/start", s.handlePortMappingStart)
-	mux.HandleFunc("POST /api/portmappings/{id}/stop", s.handlePortMappingStop)
-	mux.HandleFunc("DELETE /api/portmappings/{id}", s.handlePortMappingDelete)
+	mux.HandleFunc("GET /api/channels", s.handleChannels)
+	mux.HandleFunc("POST /api/channels", s.handleChannelSave)
+	mux.HandleFunc("POST /api/channels/{id}/start", s.handleChannelStart)
+	mux.HandleFunc("POST /api/channels/{id}/stop", s.handleChannelStop)
+	mux.HandleFunc("DELETE /api/channels/{id}", s.handleChannelDelete)
 	mux.HandleFunc("POST /api/webproxy/open", s.handleOpenWeb)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
 	mux.HandleFunc("PUT /api/settings", s.handleSettingsSave)
@@ -718,51 +713,51 @@ func pathBase(value string) string {
 	return value
 }
 
-func (s *Server) handleTunnels(w http.ResponseWriter, _ *http.Request) {
-	tunnels, err := s.app.ListTunnels()
+// handleChannels 返回统一通道列表（ssh 通道 + npa 通道）。
+func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
+	channels, err := s.app.ListChannels(policy.WithSource(r.Context(), policy.SourceWeb))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, 200, tunnels)
+	writeJSON(w, 200, channels)
 }
 
-func (s *Server) handleTunnelSave(w http.ResponseWriter, r *http.Request) {
-	var definition model.Tunnel
+// handleChannelSave 新建或更新一条通道。请求体是统一通道定义：
+// category 取 "ssh" 或 "npa"，分别落到 SSH 隧道与 NPA 端口映射。
+func (s *Server) handleChannelSave(w http.ResponseWriter, r *http.Request) {
+	var definition model.Channel
 	if err := decodeJSON(r, &definition); err != nil {
 		writeError(w, err)
 		return
 	}
-	if definition.ID == "" {
-		definition.ID = fmt.Sprintf("tunnel-%d", time.Now().UnixNano())
-	}
-	if err := s.app.SaveTunnel(policy.WithSource(r.Context(), policy.SourceWeb), definition); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, 200, definition)
-}
-
-func (s *Server) handleTunnelStart(w http.ResponseWriter, r *http.Request) {
-	definition, err := s.app.StartTunnel(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id"))
+	saved, err := s.app.SaveChannel(policy.WithSource(r.Context(), policy.SourceWeb), definition)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	definition.ListenPort = s.app.Tunnels.RuntimePort(definition.ID)
-	writeJSON(w, 200, definition)
+	writeJSON(w, 200, saved)
 }
 
-func (s *Server) handleTunnelStop(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.StopTunnel(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
+func (s *Server) handleChannelStart(w http.ResponseWriter, r *http.Request) {
+	channel, err := s.app.StartChannel(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, channel)
+}
+
+func (s *Server) handleChannelStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.StopChannel(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"stopped": true})
 }
 
-func (s *Server) handleTunnelDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.DeleteTunnel(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
+func (s *Server) handleChannelDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteChannel(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -785,57 +780,6 @@ func (s *Server) handleOpenWeb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"path": path, "url": "http://127.0.0.1:56700" + path})
-}
-
-func (s *Server) handlePortMappings(w http.ResponseWriter, _ *http.Request) {
-	mappings, err := s.app.ListPortMappings()
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, 200, mappings)
-}
-
-func (s *Server) handlePortMappingSave(w http.ResponseWriter, r *http.Request) {
-	var definition model.PortMapping
-	if err := decodeJSON(r, &definition); err != nil {
-		writeError(w, err)
-		return
-	}
-	if definition.ID == "" {
-		definition.ID = fmt.Sprintf("map-%d", time.Now().UnixNano())
-	}
-	if err := s.app.SavePortMapping(policy.WithSource(r.Context(), policy.SourceWeb), definition); err != nil {
-		writeError(w, err)
-		return
-	}
-	saved, _ := s.app.Store.GetPortMapping(definition.ID)
-	writeJSON(w, 200, saved)
-}
-
-func (s *Server) handlePortMappingStart(w http.ResponseWriter, r *http.Request) {
-	definition, err := s.app.StartPortMapping(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, 200, definition)
-}
-
-func (s *Server) handlePortMappingStop(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.StopPortMapping(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, 200, map[string]bool{"stopped": true})
-}
-
-func (s *Server) handlePortMappingDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.DeletePortMapping(policy.WithSource(r.Context(), policy.SourceWeb), r.PathValue("id")); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, 200, map[string]bool{"deleted": true})
 }
 
 // handleUpdateCheck 找出版本比本机新的节点及其上的可用产物。

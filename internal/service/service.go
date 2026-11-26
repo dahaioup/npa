@@ -2141,18 +2141,18 @@ func (s *Service) SaveTunnel(ctx context.Context, definition model.Tunnel) error
 	if isLocalNodeID(definition.NodeID) {
 		return apperrors.New(apperrors.NotSupported, "local node cannot create SSH tunnels")
 	}
-	if err := s.Authorize(ctx, "tunnel.write", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.write", policy.CapTunnel); err != nil {
 		return err
 	}
 	if err := s.Store.SaveTunnel(definition); err != nil {
 		return err
 	}
-	s.Audit.Record(ctx, "tunnel.write", definition.NodeID, policy.CapTunnel, audit.SafeParameters(map[string]string{"type": definition.Type, "listen": fmt.Sprintf("%s:%d", definition.ListenAddress, definition.ListenPort)}), time.Now(), nil)
+	s.Audit.Record(ctx, "channel.write", definition.NodeID, policy.CapTunnel, audit.SafeParameters(map[string]string{"type": definition.Type, "listen": fmt.Sprintf("%s:%d", definition.ListenAddress, definition.ListenPort)}), time.Now(), nil)
 	return nil
 }
 
 func (s *Service) StartTunnel(ctx context.Context, id string) (model.Tunnel, error) {
-	if err := s.Authorize(ctx, "tunnel.open", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.open", policy.CapTunnel); err != nil {
 		return model.Tunnel{}, err
 	}
 	definition, err := s.Store.GetTunnel(id)
@@ -2170,25 +2170,25 @@ func (s *Service) StartTunnel(ctx context.Context, id string) (model.Tunnel, err
 	}
 	started := time.Now()
 	result, err := s.Tunnels.Start(ctx, id)
-	s.Audit.Record(ctx, "tunnel.open", definition.NodeID, policy.CapTunnel, audit.SafeParameters(map[string]string{"type": definition.Type}), started, err)
+	s.Audit.Record(ctx, "channel.open", definition.NodeID, policy.CapTunnel, audit.SafeParameters(map[string]string{"type": definition.Type}), started, err)
 	return result, err
 }
 
 func (s *Service) StopTunnel(ctx context.Context, id string) error {
-	if err := s.Authorize(ctx, "tunnel.close", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.close", policy.CapTunnel); err != nil {
 		return err
 	}
 	err := s.Tunnels.Stop(id)
-	s.Audit.Record(ctx, "tunnel.close", id, policy.CapTunnel, "", time.Now(), err)
+	s.Audit.Record(ctx, "channel.close", id, policy.CapTunnel, "", time.Now(), err)
 	return err
 }
 
 func (s *Service) DeleteTunnel(ctx context.Context, id string) error {
-	if err := s.Authorize(ctx, "tunnel.delete", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.delete", policy.CapTunnel); err != nil {
 		return err
 	}
 	err := s.Tunnels.Delete(id)
-	s.Audit.Record(ctx, "tunnel.delete", id, policy.CapTunnel, "", time.Now(), err)
+	s.Audit.Record(ctx, "channel.delete", id, policy.CapTunnel, "", time.Now(), err)
 	return err
 }
 
@@ -2204,18 +2204,18 @@ func portMappingParameters(definition model.PortMapping) map[string]string {
 }
 
 func (s *Service) SavePortMapping(ctx context.Context, definition model.PortMapping) error {
-	if err := s.Authorize(ctx, "portmap.write", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.write", policy.CapTunnel); err != nil {
 		return err
 	}
 	if err := s.Store.SavePortMapping(definition); err != nil {
 		return err
 	}
-	s.Audit.Record(ctx, "portmap.write", "", policy.CapTunnel, audit.SafeParameters(portMappingParameters(definition)), time.Now(), nil)
+	s.Audit.Record(ctx, "channel.write", "", policy.CapTunnel, audit.SafeParameters(portMappingParameters(definition)), time.Now(), nil)
 	return nil
 }
 
 func (s *Service) StartPortMapping(ctx context.Context, id string) (model.PortMapping, error) {
-	if err := s.Authorize(ctx, "portmap.open", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.open", policy.CapTunnel); err != nil {
 		return model.PortMapping{}, err
 	}
 	definition, err := s.Store.GetPortMapping(id)
@@ -2225,25 +2225,25 @@ func (s *Service) StartPortMapping(ctx context.Context, id string) (model.PortMa
 	started := time.Now()
 	result, err := s.PortMappings.Start(ctx, id)
 	result.RuntimePort, result.ViaRoute = s.PortMappings.RuntimeInfo(id)
-	s.Audit.Record(ctx, "portmap.open", "", policy.CapTunnel, audit.SafeParameters(portMappingParameters(result)), started, err)
+	s.Audit.Record(ctx, "channel.open", "", policy.CapTunnel, audit.SafeParameters(portMappingParameters(result)), started, err)
 	return result, err
 }
 
 func (s *Service) StopPortMapping(ctx context.Context, id string) error {
-	if err := s.Authorize(ctx, "portmap.close", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.close", policy.CapTunnel); err != nil {
 		return err
 	}
 	err := s.PortMappings.Stop(id)
-	s.Audit.Record(ctx, "portmap.close", id, policy.CapTunnel, "", time.Now(), err)
+	s.Audit.Record(ctx, "channel.close", id, policy.CapTunnel, "", time.Now(), err)
 	return err
 }
 
 func (s *Service) DeletePortMapping(ctx context.Context, id string) error {
-	if err := s.Authorize(ctx, "portmap.delete", policy.CapTunnel); err != nil {
+	if err := s.Authorize(ctx, "channel.delete", policy.CapTunnel); err != nil {
 		return err
 	}
 	err := s.PortMappings.Delete(id)
-	s.Audit.Record(ctx, "portmap.delete", id, policy.CapTunnel, "", time.Now(), err)
+	s.Audit.Record(ctx, "channel.delete", id, policy.CapTunnel, "", time.Now(), err)
 	return err
 }
 
@@ -2296,16 +2296,16 @@ func (s *Service) Overview() model.Overview {
 			connected++
 		}
 	}
-	tunnels, _ := s.Tunnels.List()
+	channels, _ := s.ListChannels(context.Background())
 	running := 0
-	for _, definition := range tunnels {
-		if definition.Status == "running" {
+	for _, channel := range channels {
+		if channel.Status == model.ChannelStatusRunning {
 			running++
 		}
 	}
 	return model.Overview{
 		Version: Version, UptimeSeconds: int64(time.Since(s.started).Seconds()),
-		Nodes: len(byAddr), Connected: connected, Tunnels: len(tunnels), Running: running,
+		Nodes: len(byAddr), Connected: connected, Channels: len(channels), Running: running,
 		MCPEnabled: parseBool(s.Settings()["mcp_enabled"]),
 	}
 }

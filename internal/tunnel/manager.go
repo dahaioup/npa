@@ -24,6 +24,12 @@ type Repository interface {
 	DeleteTunnel(id string) error
 }
 
+// sshClient 是隧道用到的 SSH 客户端能力（标准库的 *ssh.Client 满足它）。
+type sshClient interface {
+	Dial(network, addr string) (net.Conn, error)
+	Listen(network, laddr string) (net.Listener, error)
+}
+
 type runtimeState struct {
 	cancel   context.CancelFunc
 	listener net.Listener
@@ -102,10 +108,7 @@ func (m *Manager) Start(ctx context.Context, id string) (model.Tunnel, error) {
 	m.mu.Unlock()
 	isPeer := m.IsPeer != nil && m.IsPeer(tunnel.NodeID)
 	var (
-		sshClient interface {
-			Dial(network, addr string) (net.Conn, error)
-			Listen(network, laddr string) (net.Listener, error)
-		}
+		client   sshClient
 		listener net.Listener
 	)
 	listenAddress := listenHostPort(tunnel.ListenAddress, tunnel.ListenPort)
@@ -118,23 +121,23 @@ func (m *Manager) Start(ctx context.Context, id string) (model.Tunnel, error) {
 			_ = m.repo.UpdateTunnelStatus(id, "error", err.Error())
 			return tunnel, err
 		}
-		client, clientErr := m.ssh.Client(ctx, tunnel.NodeID)
-		if clientErr != nil {
-			_ = m.repo.UpdateTunnelStatus(id, "error", clientErr.Error())
-			return tunnel, clientErr
+		connected, err := m.tunnelClient(ctx, tunnel)
+		if err != nil {
+			_ = m.repo.UpdateTunnelStatus(id, "error", err.Error())
+			return tunnel, err
 		}
-		sshClient = client
+		client = connected
 		listener, err = client.Listen("tcp", listenAddress)
 	} else {
 		// Local / SOCKS 的数据面走 DialTarget（peer 节点经反向链路），
 		// 但非 peer 节点仍先建立 SSH 连接，保持"启动即校验"的快速失败反馈。
 		if !isPeer {
-			client, clientErr := m.ssh.Client(ctx, tunnel.NodeID)
+			connected, clientErr := m.tunnelClient(ctx, tunnel)
 			if clientErr != nil {
 				_ = m.repo.UpdateTunnelStatus(id, "error", clientErr.Error())
 				return tunnel, clientErr
 			}
-			sshClient = client
+			client = connected
 		}
 		listener, err = net.Listen("tcp", listenAddress)
 	}
@@ -155,14 +158,19 @@ func (m *Manager) Start(ctx context.Context, id string) (model.Tunnel, error) {
 	m.runtime[id] = state
 	m.mu.Unlock()
 	_ = m.repo.UpdateTunnelStatus(id, "running", "")
-	go m.acceptLoop(runCtx, tunnel, listener, sshClient)
+	go m.acceptLoop(runCtx, tunnel, listener, client)
 	return tunnel, nil
 }
 
-func (m *Manager) acceptLoop(ctx context.Context, definition model.Tunnel, listener net.Listener, sshClient interface {
-	Dial(network, addr string) (net.Conn, error)
-	Listen(network, laddr string) (net.Listener, error)
-}) {
+// tunnelClient 取隧道的 SSH 客户端：设置了跳板节点就先连跳板再穿过去。
+func (m *Manager) tunnelClient(ctx context.Context, tunnel model.Tunnel) (sshClient, error) {
+	if strings.TrimSpace(tunnel.ViaNodeID) != "" {
+		return m.ssh.ConnectVia(ctx, tunnel.NodeID, tunnel.ViaNodeID)
+	}
+	return m.ssh.Client(ctx, tunnel.NodeID)
+}
+
+func (m *Manager) acceptLoop(ctx context.Context, definition model.Tunnel, listener net.Listener, sshClient sshClient) {
 	backoff := time.Second
 	for {
 		conn, err := listener.Accept()
@@ -184,10 +192,7 @@ func (m *Manager) acceptLoop(ctx context.Context, definition model.Tunnel, liste
 	}
 }
 
-func (m *Manager) handleConnection(ctx context.Context, definition model.Tunnel, inbound net.Conn, sshClient interface {
-	Dial(network, addr string) (net.Conn, error)
-	Listen(network, laddr string) (net.Listener, error)
-}) {
+func (m *Manager) handleConnection(ctx context.Context, definition model.Tunnel, inbound net.Conn, sshClient sshClient) {
 	defer inbound.Close()
 	if definition.Type == "socks" {
 		m.handleSOCKS(ctx, definition, inbound, sshClient)
@@ -212,9 +217,7 @@ func (m *Manager) handleConnection(ctx context.Context, definition model.Tunnel,
 	pipe(inbound, remote)
 }
 
-func (m *Manager) handleSOCKS(ctx context.Context, definition model.Tunnel, conn net.Conn, sshClient interface {
-	Dial(network, addr string) (net.Conn, error)
-}) {
+func (m *Manager) handleSOCKS(ctx context.Context, definition model.Tunnel, conn net.Conn, sshClient sshClient) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil || header[0] != 5 {
 		return
@@ -280,7 +283,7 @@ func (m *Manager) dialTarget(ctx context.Context, nodeID, address string) (net.C
 	if m.DialTarget != nil {
 		return m.DialTarget(ctx, nodeID, address)
 	}
-	client, err := m.ssh.Client(ctx, nodeID)
+	client, err := m.tunnelClient(ctx, model.Tunnel{NodeID: nodeID})
 	if err != nil {
 		return nil, err
 	}

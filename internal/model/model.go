@@ -53,8 +53,11 @@ type Credential struct {
 }
 
 type Tunnel struct {
-	ID            string    `json:"id"`
-	NodeID        string    `json:"node_id"`
+	ID     string `json:"id"`
+	NodeID string `json:"node_id"`
+	// ViaNodeID 是 SSH 跳板节点：到目标节点的 SSH 连接先连跳板，再在跳板上开
+	// direct-tcpip 通道到目标。只使用跳板自身的地址，不依赖 NPA 网络。
+	ViaNodeID     string    `json:"via_node_id,omitempty"`
 	Name          string    `json:"name"`
 	Type          string    `json:"type"`
 	ListenAddress string    `json:"listen_address"`
@@ -120,7 +123,7 @@ type Overview struct {
 	UptimeSeconds int64  `json:"uptime_seconds"`
 	Nodes         int    `json:"nodes"`
 	Connected     int    `json:"connected"`
-	Tunnels       int    `json:"tunnels"`
+	Channels      int    `json:"channels"`
 	Running       int    `json:"running"`
 	MCPEnabled    bool   `json:"mcp_enabled"`
 }

@@ -34,7 +34,8 @@ func TestPluginHTTPDefaults(t *testing.T) {
 	}{
 		{PluginSlotBrowser, 56753, PluginExposureLocal, true},
 		{PluginSlotFile, 56751, PluginExposureAuto, false},
-		{PluginSlotDesktop, 56750, PluginExposureLAN, false},
+		// 远控插件的 MCP 与网页同一个端口（自签 HTTPS），NPA 代理放行自签证书。
+		{PluginSlotDesktop, 56750, PluginExposureLAN, true},
 	}
 	for _, item := range cases {
 		info := app.PluginHTTP(item.slot)

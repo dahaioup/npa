@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -41,7 +42,7 @@ func PluginMCPHandler(app *service.Service, slot string, face service.MCPFace) h
 			http.Error(w, "plugin MCP service is not available", http.StatusForbidden)
 			return
 		}
-		proxy := newPluginMCPProxy(info.Port)
+		proxy := newPluginMCPProxy(info.Port, info.MCPTLS)
 		proxy.ServeHTTP(w, r)
 	})
 }
@@ -50,8 +51,20 @@ func PluginMCPHandler(app *service.Service, slot string, face service.MCPFace) h
 //
 // 插件永远只绑本机（127.0.0.1）：NPA 从回环访问它，外部设备通过 NPA 的
 // 56701 用它的 MCP。
-func newPluginMCPProxy(port int) *httputil.ReverseProxy {
-	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port), Path: "/mcp"}
+//
+// tls=true 时按自签 HTTPS 处理：远控插件的网页与 MCP 共用一个端口，而网页
+// 必须走 HTTPS（浏览器只在 secure context 下给 WebCodecs），证书是插件自己
+// 生成的自签证书，代理只连回环，因此放行自签证书。
+func newPluginMCPProxy(port int, useTLS bool) *httputil.ReverseProxy {
+	scheme := "http"
+	target := &url.URL{Scheme: scheme, Host: "127.0.0.1:" + strconv.Itoa(port), Path: "/mcp"}
+	transport := http.DefaultTransport
+	if useTLS {
+		target.Scheme = "https"
+		transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // 回环自签证书
+		}
+	}
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
@@ -59,6 +72,7 @@ func newPluginMCPProxy(port int) *httputil.ReverseProxy {
 			req.URL.Path = target.Path
 			req.Host = target.Host
 		},
+		Transport: transport,
 		// SSE 要即时下推，代理不能攒着缓冲。
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {

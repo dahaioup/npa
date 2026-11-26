@@ -49,6 +49,8 @@ type pluginSlot struct {
 	httpExposure string
 	// hasMCP 表示插件在 HTTP 上提供 MCP 服务（/mcp）。
 	hasMCP bool
+	// mcpTLS 表示插件的 MCP 走自签 HTTPS（代理要放行自签证书）。
+	mcpTLS bool
 }
 
 // PluginParamView 是一个参数的展示形态。
@@ -100,7 +102,9 @@ func (s *Service) pluginSlots() []pluginSlot {
 			name: PluginSlotDesktop, title: "桌面控制",
 			manager: s.Plugin, capabilities: []string{"screenshot", "mouse"},
 			// 远控插件本来就是给局域网里其它设备访问的：默认监听所有网卡。
-			httpPort: 56750, httpExposure: PluginExposureLAN,
+			// 它的 MCP 端点与网页同一个端口，走自签 HTTPS（浏览器要 secure
+			// context 才能用 WebCodecs），代理放行自签证书即可。
+			httpPort: 56750, httpExposure: PluginExposureLAN, hasMCP: true, mcpTLS: true,
 		},
 		{
 			name: PluginSlotFile, title: "文件分发",

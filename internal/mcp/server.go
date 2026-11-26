@@ -66,7 +66,7 @@ func (m *Manager) Refresh() {
 	m.server.RemoveTools(
 		"nodes.list", "ssh.exec", "ssh.session_info",
 		"file.list", "file.read", "file.write", "file.remove",
-		"tunnel.list", "tunnel.open", "tunnel.close", "service.open_web",
+		"channel.list", "channel.open", "channel.close", "service.open_web",
 		"desktop.screens", "desktop.screenshot", "desktop.mouse_move", "desktop.mouse_click", "desktop.mouse_scroll",
 		"discovery.nodes", "discovery.refresh", "network.subnets", "relay.routes", "relay.open",
 		"screen.read", "screen.type", "screen.click", "screen.hotkey", "screen.info", "screen.move",
@@ -158,33 +158,33 @@ func (m *Manager) Refresh() {
 		})
 	}
 	if capabilities["tunnel"] {
-		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "tunnel.list", Description: "List SSH tunnels"}, func(_ context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "channel.list", Description: "List channels (ssh tunnels and npa port mappings)"}, func(_ context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
 			ctx := policy.WithSource(context.Background(), policy.SourceMCP)
-			if err := m.service.Authorize(ctx, "tunnel.list", policy.CapTunnel); err != nil {
+			if err := m.service.Authorize(ctx, "channel.list", policy.CapTunnel); err != nil {
 				return nil, nil, err
 			}
-			tunnels, err := m.service.ListTunnels()
+			channels, err := m.service.ListChannels(ctx)
 			if err != nil {
 				return nil, nil, err
 			}
-			return nil, map[string]any{"tunnels": tunnels}, nil
+			return nil, map[string]any{"channels": channels}, nil
 		})
-		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "tunnel.open", Description: "Start a saved tunnel"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
-			TunnelID string `json:"tunnel_id" jsonschema:"saved tunnel ID"`
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "channel.open", Description: "Start a saved channel"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			ChannelID string `json:"channel_id" jsonschema:"saved channel ID (ssh:<id> or npa:<id>)"`
 		}) (*mcpsdk.CallToolResult, any, error) {
-			tunnel, err := m.service.StartTunnel(mcpCtx(ctx), input.TunnelID)
+			channel, err := m.service.StartChannel(mcpCtx(ctx), input.ChannelID)
 			if err != nil {
 				return nil, nil, err
 			}
-			return nil, tunnel, nil
+			return nil, channel, nil
 		})
-		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "tunnel.close", Description: "Stop a running tunnel"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
-			TunnelID string `json:"tunnel_id" jsonschema:"saved tunnel ID"`
+		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "channel.close", Description: "Stop a running channel"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
+			ChannelID string `json:"channel_id" jsonschema:"saved channel ID (ssh:<id> or npa:<id>)"`
 		}) (*mcpsdk.CallToolResult, any, error) {
-			if err := m.service.StopTunnel(mcpCtx(ctx), input.TunnelID); err != nil {
+			if err := m.service.StopChannel(mcpCtx(ctx), input.ChannelID); err != nil {
 				return nil, nil, err
 			}
-			return nil, map[string]any{"stopped": input.TunnelID}, nil
+			return nil, map[string]any{"stopped": input.ChannelID}, nil
 		})
 		mcpsdk.AddTool(m.server, &mcpsdk.Tool{Name: "service.open_web", Description: "Open a node web service through the controlled proxy"}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, input struct {
 			NodeID     string `json:"node_id" jsonschema:"managed node ID"`

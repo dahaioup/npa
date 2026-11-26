@@ -186,6 +186,73 @@ func (m *Manager) Connect(ctx context.Context, nodeID string) (*ssh.Client, erro
 	return client, nil
 }
 
+// ConnectVia 通过跳板节点连接目标节点：先与跳板建立 SSH 连接，再在跳板上开
+// direct-tcpip 通道到目标地址，最后完成目标节点的 SSH 握手。
+// 跳板只使用它自身的地址（IP:端口），不经过 NPA 网络中转。
+func (m *Manager) ConnectVia(ctx context.Context, nodeID, viaNodeID string) (*ssh.Client, error) {
+	viaNodeID = strings.TrimSpace(viaNodeID)
+	if viaNodeID == "" || viaNodeID == nodeID {
+		return m.Connect(ctx, nodeID)
+	}
+	cacheKey := nodeID + "@" + viaNodeID
+	m.mu.Lock()
+	if client, ok := m.clients[cacheKey]; ok {
+		m.mu.Unlock()
+		return client, nil
+	}
+	m.mu.Unlock()
+
+	target, err := m.repo.GetNode(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	credential, err := m.repo.GetCredential(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := m.authMethods(target, credential)
+	if err != nil {
+		return nil, err
+	}
+	config := &ssh.ClientConfig{
+		User:            target.Username,
+		Auth:            auth,
+		HostKeyCallback: m.hostKeyCallback(nodeID),
+		Timeout:         m.ConnectTimeout,
+		ClientVersion:   "SSH-2.0-NPA_1",
+	}
+	jump, err := m.Connect(ctx, viaNodeID)
+	if err != nil {
+		return nil, err
+	}
+	targetAddress := net.JoinHostPort(target.Address, fmt.Sprintf("%d", target.Port))
+	raw, err := jump.Dial("tcp", targetAddress)
+	if err != nil {
+		return nil, apperrors.Wrap(apperrors.NodeOffline, "cannot reach target through jump node "+viaNodeID, err)
+	}
+	_ = raw.SetDeadline(time.Now().Add(m.ConnectTimeout))
+	connection, channels, requests, err := ssh.NewClientConn(raw, targetAddress, config)
+	if err != nil {
+		raw.Close()
+		return nil, mapConnectError(err)
+	}
+	_ = raw.SetDeadline(time.Time{})
+	client := ssh.NewClient(connection, channels, requests)
+
+	m.mu.Lock()
+	if existing, ok := m.clients[cacheKey]; ok {
+		m.mu.Unlock()
+		client.Close()
+		return existing, nil
+	}
+	m.clients[cacheKey] = client
+	runCtx, cancel := context.WithCancel(context.Background())
+	m.keepAlives[cacheKey] = cancel
+	m.mu.Unlock()
+	go m.keepAlive(cacheKey, client, runCtx)
+	return client, nil
+}
+
 func (m *Manager) keepAlive(nodeID string, client *ssh.Client, ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()

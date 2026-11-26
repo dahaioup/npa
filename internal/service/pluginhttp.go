@@ -44,6 +44,8 @@ type PluginHTTPInfo struct {
 	Scope string `json:"scope,omitempty"`
 	// HasMCP 表示插件在 HTTP 上提供 MCP 服务。
 	HasMCP bool `json:"has_mcp,omitempty"`
+	// MCPTLS 表示插件的 MCP 走自签 HTTPS。
+	MCPTLS bool `json:"mcp_tls,omitempty"`
 	// MCPEnabled 表示插件的 MCP 服务是否启用。
 	MCPEnabled bool `json:"mcp_enabled"`
 	// PageURL 是插件自带页面的地址（127.0.0.1 视角）。
@@ -65,10 +67,15 @@ func (s *Service) PluginHTTP(slot string) *PluginHTTPInfo {
 		Exposure:   s.PluginHTTPExposure(found.name),
 		Scope:      s.PluginScope(found.name),
 		HasMCP:     found.hasMCP,
+		MCPTLS:     found.mcpTLS,
 		MCPEnabled: s.PluginMCPEnabled(found.name),
 		MCPPath:    "/plugins/" + found.name + "/mcp",
 	}
-	info.PageURL = "http://127.0.0.1:" + strconv.Itoa(info.Port) + "/"
+	scheme := "http"
+	if found.mcpTLS {
+		scheme = "https"
+	}
+	info.PageURL = scheme + "://127.0.0.1:" + strconv.Itoa(info.Port) + "/"
 	return info
 }
 

@@ -105,7 +105,7 @@ func TestEmbeddedUIPermissionRefactor(t *testing.T) {
 	}
 }
 
-func TestPortMappingLifecycle(t *testing.T) {
+func TestChannelLifecycle(t *testing.T) {
 	store, err := state.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -116,8 +116,8 @@ func TestPortMappingLifecycle(t *testing.T) {
 	defer server.Close()
 	defer app.Close()
 
-	body := `{"name":"RustDesk","target_host":"192.168.50.21","target_port":21115,"listen_address":"127.0.0.1","listen_port":0,"auto_start":true}`
-	response, err := http.Post(server.URL+"/api/portmappings", "application/json", strings.NewReader(body))
+	body := `{"category":"npa","name":"RustDesk","target_host":"192.168.50.21","target_port":21115,"listen_address":"127.0.0.1","listen_port":0,"auto_start":true}`
+	response, err := http.Post(server.URL+"/api/channels", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,43 +125,44 @@ func TestPortMappingLifecycle(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("create returned %d", response.StatusCode)
 	}
-	var created struct {
-		ID string `json:"id"`
-	}
+	var created model.Channel
 	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
 	if created.ID == "" {
-		t.Fatal("mapping id must be assigned")
+		t.Fatal("channel id must be assigned")
 	}
-	started, err := http.Post(server.URL+"/api/portmappings/"+created.ID+"/start", "application/json", nil)
+	if created.Category != model.ChannelCategoryNPA {
+		t.Fatalf("unexpected channel category: %q", created.Category)
+	}
+	started, err := http.Post(server.URL+"/api/channels/"+created.ID+"/start", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var running map[string]any
+	var running model.Channel
 	if err := json.NewDecoder(started.Body).Decode(&running); err != nil {
 		t.Fatal(err)
 	}
 	started.Body.Close()
 	if started.StatusCode != http.StatusOK {
-		t.Fatalf("start returned %d (%v)", started.StatusCode, running)
+		t.Fatalf("start returned %d", started.StatusCode)
 	}
-	if running["status"] != "running" {
-		t.Fatalf("mapping must be running: %#v", running)
+	if running.Status != model.ChannelStatusRunning {
+		t.Fatalf("channel must be running: %#v", running)
 	}
-	listResponse, err := http.Get(server.URL + "/api/portmappings")
+	listResponse, err := http.Get(server.URL + "/api/channels")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mappings []model.PortMapping
-	if err := json.NewDecoder(listResponse.Body).Decode(&mappings); err != nil {
+	var channels []model.Channel
+	if err := json.NewDecoder(listResponse.Body).Decode(&channels); err != nil {
 		t.Fatal(err)
 	}
 	listResponse.Body.Close()
-	if len(mappings) != 1 || mappings[0].Status != "running" || mappings[0].RuntimePort == 0 {
-		t.Fatalf("unexpected mappings: %#v", mappings)
+	if len(channels) != 1 || channels[0].Status != model.ChannelStatusRunning || channels[0].RuntimePort == 0 {
+		t.Fatalf("unexpected channels: %#v", channels)
 	}
-	stopped, err := http.Post(server.URL+"/api/portmappings/"+created.ID+"/stop", "application/json", nil)
+	stopped, err := http.Post(server.URL+"/api/channels/"+created.ID+"/stop", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,20 +170,29 @@ func TestPortMappingLifecycle(t *testing.T) {
 	if stopped.StatusCode != http.StatusOK {
 		t.Fatalf("stop returned %d", stopped.StatusCode)
 	}
-	deleted, err := http.NewRequest(http.MethodDelete, server.URL+"/api/portmappings/"+created.ID, nil)
+	deleted, err := http.NewRequest(http.MethodDelete, server.URL+"/api/channels/"+created.ID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err = http.DefaultClient.Do(deleted)
+	deletedResponse, err := http.DefaultClient.Do(deleted)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("delete returned %d", response.StatusCode)
+	deletedResponse.Body.Close()
+	if deletedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("delete returned %d", deletedResponse.StatusCode)
 	}
-	if _, err := store.GetPortMapping(created.ID); err == nil {
-		t.Fatal("mapping must be removed from the store")
+	listAfter, err := http.Get(server.URL + "/api/channels")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remaining []model.Channel
+	if err := json.NewDecoder(listAfter.Body).Decode(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	listAfter.Body.Close()
+	if len(remaining) != 0 {
+		t.Fatalf("channel must be deleted: %#v", remaining)
 	}
 }
 
